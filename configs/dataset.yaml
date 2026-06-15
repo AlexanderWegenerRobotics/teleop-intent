@@ -1,0 +1,36 @@
+data:
+  store_root: C:/Users/ceti/Documents/05_data/teleop-sorting/avatar
+  manifest: data/manifest.csv
+  episode_glob: "[0-9][0-9][0-9]"
+  require_intent: true
+  include_success: [success, partial]
+split:
+  seed: 0
+  ratios:                           # must sum to 1.0
+    train: 0.70
+    val: 0.15
+    test: 0.15
+  by: "episode"
+  include_success:
+    - success
+    - partial
+  stratify_by:
+    - success
+    - color_bin_mapping
+  min_gaze_valid_frac: 0.0
+  out_dir: "data/splits"
+
+
+state:
+  enum:
+    OFFLINE: 0
+    IDLE: 1
+    HOMING: 2
+    AWAITING: 3
+    ENGAGED: 4
+    PAUSED: 5
+    FAULT: 6
+    STOP: 7
+    RECOVERING: 8
+    UNDEFINED: 255
+  train_states: [ENGAGED]  # frames in these states are valid training samples
