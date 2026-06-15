@@ -1,0 +1,20 @@
+camera:
+  primary: head_cam_left
+  show_wrists: true
+
+gaze:
+  show: true
+  dot_radius_px: 4
+  color: [245, 158, 11]
+
+model:
+  name: none
+  checkpoint: null
+
+display:
+  fps: 30
+  candidate_names: []
+
+data:
+  store_root: null
+  episode: null
