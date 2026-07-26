@@ -49,13 +49,16 @@ except ImportError:
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from common import (  # noqa: E402
+    PHASE_NAMES,
+    candidate_names_from_cfg,
+    candidate_names_from_hdf5,
+    compute_ee_speed,
+    compute_gaze_px,
+    compute_slot_boxes,
+    load_config,
+)
 from models.base import CandidateFeatures, IntentModel, IntentPrediction
-
-
-def load_config(path: str) -> dict:
-    """Returns merged config: file defaults overridden by CLI flags later."""
-    with open(path) as f:
-        return yaml.safe_load(f)
 
 
 def resolve_episode_path(cfg: dict, episode_id: str) -> Path:
@@ -79,20 +82,6 @@ def load_model(cfg: dict) -> Optional[IntentModel]:
     if checkpoint:
         model.load(checkpoint)
     return model
-
-
-def candidate_names_from_cfg(cfg: dict, n_slots: int) -> list[str]:
-    """Returns per-candidate display names from config, padding with slot indices."""
-    names = cfg["display"].get("candidate_names") or []
-    result = list(names[:n_slots])
-    for i in range(len(result), n_slots):
-        result.append(f"slot_{i}")
-    return result
-
-
-def gaze_color(cfg: dict) -> list[int]:
-    """Returns the [R, G, B] gaze dot color from config."""
-    return cfg["gaze"].get("color", [245, 158, 11])
 
 
 def build_candidate_features(intent: h5py.Group, t: int) -> Optional[CandidateFeatures]:
@@ -143,55 +132,48 @@ def log_camera(name: str, frame: np.ndarray, path: str) -> None:
 
 def log_gaze(intent: h5py.Group, t: int, cfg: dict, img_shape: tuple, camera: str) -> None:
     """Logs the gaze point as a 2D point overlay on the primary camera.
-
-    UE5 logs gaze as: gaze_px_x = GazeUV.X * full_stereo_texture_width.
-    The stored images are per-eye (half that width).  gaze_px_ref_width may be
-    stored as either the full stereo width or the per-eye width; we normalise
-    to full-stereo space before splitting by eye.
-
-    Left eye:  valid when raw_x in [0, eye_w); gx = raw_x
-    Right eye: valid when raw_x in [eye_w, 2*eye_w); gx = raw_x - eye_w
+    Pixel math lives in common.compute_gaze_px — shared with the standalone
+    labeler so the two tools can never disagree on where the dot goes.
     """
-    if not cfg["gaze"].get("show", True):
+    gp = compute_gaze_px(intent, t, cfg, img_shape)
+    if gp is None:
         return
-    if "gaze_px_x" not in intent or "gaze_px_y" not in intent:
-        return
-    if "gaze_valid" in intent and not bool(intent["gaze_valid"][t]):
-        return
-
-    stored_h, stored_w = img_shape[:2]
-    px_normalized = bool(intent.attrs.get("px_normalized", False))
-
-    raw_x = float(intent["gaze_px_x"][t])
-    raw_y = float(intent["gaze_px_y"][t])
-
-    if px_normalized:
-        gaze_uv_x = raw_x
-        gaze_uv_y = raw_y
-    else:
-        gaze_ref_w = float(intent.attrs.get("gaze_px_ref_width", stored_w * 2))
-        gaze_ref_h = float(intent.attrs.get("gaze_px_ref_height", stored_h))
-        full_w = gaze_ref_w if gaze_ref_w > stored_w else stored_w * 2
-        gaze_uv_x = raw_x / full_w
-        gaze_uv_y = raw_y / gaze_ref_h
-
-    is_right_eye = camera.endswith("_right")
-    if is_right_eye:
-        if gaze_uv_x < 0.5 or gaze_uv_x > 1.0:
-            return
-        gx = (gaze_uv_x - 0.5) * 2.0 * stored_w
-    else:
-        if gaze_uv_x < 0.0 or gaze_uv_x >= 0.5:
-            return
-        gx = gaze_uv_x * 2.0 * stored_w
-
-    gy = gaze_uv_y * stored_h
-
+    gx, gy = gp
     radius = cfg["gaze"].get("dot_radius_px", 5)
-    rr.log(
-        "camera/primary/gaze",
-        rr.Points2D([[gx, gy]], radii=[radius], colors=[[220, 30, 30, 255]]),
-    )
+    rr.log("camera/primary/gaze", rr.Points2D([[gx, gy]], radii=[radius], colors=[[220, 30, 30, 255]]))
+
+
+def log_slot_boxes(intent: h5py.Group, t: int, img_shape: tuple, ep_file: h5py.File, names: list[str]) -> None:
+    """Overlays projected slot bounding boxes on the primary camera image.
+    Projection + belief lookup lives in common.compute_slot_boxes; this
+    function only maps belief -> Rerun color and logs the boxes.
+    """
+    ee_boxes, tgt_boxes = compute_slot_boxes(intent, t, img_shape, ep_file, names)
+    box_half = 12.0
+
+    if tgt_boxes:
+        max_b = max(b["belief"] for b in tgt_boxes) or 1.0
+        colors = []
+        for b in tgt_boxes:
+            tc = b["belief"] / max_b if max_b > 1e-6 else 0.0
+            colors.append([255, int(255 * (1.0 - 0.7 * tc)), int(255 * (1.0 - tc)), 200])
+        rr.log("camera/primary/slots_target", rr.Boxes2D(
+            centers=[[b["u"], b["v"]] for b in tgt_boxes],
+            half_sizes=[[box_half, box_half]] * len(tgt_boxes),
+            colors=colors, labels=[b["label"] for b in tgt_boxes],
+        ))
+
+    if ee_boxes:
+        max_b = max(b["belief"] for b in ee_boxes) or 1.0
+        colors = []
+        for b in ee_boxes:
+            tc = b["belief"] / max_b if max_b > 1e-6 else 0.0
+            colors.append([int(100 * (1.0 - tc)), int(180 + 75 * tc), 255, 200])
+        rr.log("camera/primary/slots_ee", rr.Boxes2D(
+            centers=[[b["u"], b["v"]] for b in ee_boxes],
+            half_sizes=[[box_half, box_half]] * len(ee_boxes),
+            colors=colors, labels=[b["label"] for b in ee_boxes],
+        ))
 
 
 def log_intent_posterior(
@@ -205,18 +187,150 @@ def log_intent_posterior(
     for i, (p, valid) in enumerate(zip(posterior, mask)):
         if not valid:
             continue
-        label = names[i] if i < len(names) else f"slot {i}"
+        label = names[i] if i < len(names) else f"slot_{i}"
         rr.log(f"intent/posterior/{label}", rr.Scalars(float(p)))
 
     rr.log("intent/entropy", rr.Scalars(entropy))
 
 
 def log_belief_from_hdf5(intent: h5py.Group, t: int, names: list[str]) -> None:
-    """Logs slot_belief_* from HDF5 when no model is active (logger filter, labelled clearly)."""
-    belief_keys = sorted(k for k in intent.keys() if k.startswith("slot_belief_"))
-    for i, k in enumerate(belief_keys):
-        label = names[i] if i < len(names) else f"slot {i}"
-        rr.log(f"intent/logger_belief/{label}", rr.Scalars(float(intent[k][t])))
+    """Logs EE and target beliefs from HDF5 (two separate Bayesian streams, name-keyed).
+
+    After recompute, datasets are:
+      ee_belief_{name}   — end-effector attention (ee_left, ee_right, null)
+      tgt_belief_{name}  — object/bin attention   (object_*, bin_*, null)
+    Falls back to legacy slot_belief_* if new datasets are absent.
+    """
+    has_split = any(k.startswith("ee_belief_") for k in intent.keys())
+
+    if has_split:
+        for k in sorted(k for k in intent.keys() if k.startswith("ee_belief_")):
+            label = k[len("ee_belief_"):]          # strip prefix → "ee_left", "null", etc.
+            rr.log(f"intent/ee_belief/{label}", rr.Scalars(float(intent[k][t])))
+        for k in sorted(k for k in intent.keys() if k.startswith("tgt_belief_")):
+            label = k[len("tgt_belief_"):]
+            rr.log(f"intent/target_belief/{label}", rr.Scalars(float(intent[k][t])))
+    else:
+        # Legacy fallback: monolithic slot_belief_* (numeric, sorted properly)
+        belief_keys = sorted((k for k in intent.keys() if k.startswith("slot_belief_")),
+                             key=lambda k: int(k.rsplit("_", 1)[-1]))
+        for i, k in enumerate(belief_keys):
+            label = names[i] if i < len(names) else f"slot_{i}"
+            if i > len(names):
+                break
+            rr.log(f"intent/logger_belief/{label}", rr.Scalars(float(intent[k][t])))
+
+
+def log_intent_summary(intent: h5py.Group, t: int) -> None:
+    """Logs a text panel showing the highest-attention EE and target with probabilities."""
+    has_split = any(k.startswith("ee_belief_") for k in intent.keys())
+
+    if has_split:
+        ee_items  = [(k[len("ee_belief_"):],  float(intent[k][t]))
+                     for k in intent.keys()
+                     if k.startswith("ee_belief_") and k != "ee_belief_null"]
+        tgt_items = [(k[len("tgt_belief_"):], float(intent[k][t]))
+                     for k in intent.keys()
+                     if k.startswith("tgt_belief_") and k != "tgt_belief_null"]
+
+        ee_null  = float(intent["ee_belief_null"][t])  if "ee_belief_null"  in intent else 0.0
+        tgt_null = float(intent["tgt_belief_null"][t]) if "tgt_belief_null" in intent else 0.0
+
+        ee_top  = max(ee_items,  key=lambda x: x[1]) if ee_items  else ("—", 0.0)
+        tgt_top = max(tgt_items, key=lambda x: x[1]) if tgt_items else ("—", 0.0)
+
+        tgt_others = sorted([x for x in tgt_items if x[0] != tgt_top[0] and x[1] > 0.15],
+                            key=lambda x: -x[1])
+        lines = [
+            f"EE:     {ee_top[0]}  ({ee_top[1]:.2f})",
+            f"Target: {tgt_top[0]}  ({tgt_top[1]:.2f})  null={tgt_null:.2f}",
+        ]
+        if tgt_others:
+            lines.append("  also: " + "  ".join(f"{n} {p:.2f}" for n, p in tgt_others))
+    else:
+        lines = ["(recompute to see split EE/target belief)"]
+
+    rr.log("intent/summary", rr.TextDocument("\n".join(lines)))
+
+
+def load_segments(ep: h5py.File) -> dict | None:
+    """Load per-frame label data from the labels/ group.
+
+    Segments (labels/segments/*) are an optional legacy table from the old
+    heuristic auto-labeler; hand labels (labeling/label_tool.py) only write
+    the per-frame arm_{side}_phase / arm_{side}_target_name arrays, so both
+    are treated as optional here — only the arrays that exist are returned.
+
+    Returns dict with keys:
+      segments:      list of segment dicts (empty unless a legacy segments table exists)
+      arm_phase:     {side: np.ndarray [T] int8}
+      arm_target:    {side: np.ndarray [T] bytes}  — target name per frame
+      label_source:  str  — "manual", "heuristic", or "" if unset
+    or None if the episode has no labels at all.
+    """
+    if "labels" not in ep:
+        return None
+    lbl = ep["labels"]
+
+    segs = []
+    if "segments" in lbl:
+        sg = lbl["segments"]
+        n  = int(sg.attrs.get("n_segments", 0))
+        if n > 0:
+            arms  = [v.decode() if isinstance(v, (bytes, np.bytes_)) else str(v) for v in sg["arm"][:]]
+            names = [v.decode() if isinstance(v, (bytes, np.bytes_)) else str(v) for v in sg["object_name"][:]]
+            g_fr  = sg["grasp_frame"][:].tolist()
+            r_fr  = sg["release_frame"][:].tolist()
+            dests = [v.decode() if isinstance(v, (bytes, np.bytes_)) else str(v) for v in sg["destination"][:]]
+            for i in range(n):
+                segs.append({"arm": arms[i], "object_name": names[i],
+                             "grasp_frame": g_fr[i], "release_frame": r_fr[i],
+                             "destination": dests[i] or None})
+
+    arm_phase  = {}
+    arm_target = {}
+    for side in ("left", "right"):
+        pk = f"arm_{side}_phase"
+        tk = f"arm_{side}_target_name"
+        if pk in lbl:
+            arm_phase[side]  = lbl[pk][:]
+        if tk in lbl:
+            arm_target[side] = lbl[tk][:]
+
+    if not segs and not arm_phase and not arm_target:
+        return None
+
+    label_source = str(lbl.attrs.get("label_source", ""))
+    return {"segments": segs, "arm_phase": arm_phase,
+            "arm_target": arm_target, "label_source": label_source}
+
+
+def log_label_signals(seg_data: dict, t: int) -> None:
+    """Log a compact per-frame label summary (phase + target per arm) as a
+    single text panel — a numeric table is easier to read at a glance than
+    stepped timeseries plots for a handful of discrete states."""
+    arm_phase  = seg_data.get("arm_phase",  {})
+    arm_target = seg_data.get("arm_target", {})
+    source     = seg_data.get("label_source", "")
+
+    lines = []
+    for side in ("left", "right"):
+        phase_arr  = arm_phase.get(side)
+        target_arr = arm_target.get(side)
+
+        if target_arr is not None and t < len(target_arr):
+            raw = target_arr[t]
+            tgt = raw.decode() if isinstance(raw, (bytes, np.bytes_)) else str(raw)
+        else:
+            tgt = "null"
+
+        phase_name = PHASE_NAMES.get(int(phase_arr[t]) if phase_arr is not None and t < len(phase_arr) else 0, "?")
+        lines.append(f"{side:<5}  {phase_name:<11}  {tgt}")
+
+    header = "arm    phase        target"
+    if source:
+        header += f"   ({source})"
+    rr.log("labels/summary", rr.TextDocument(header + "\n" + "\n".join(lines)))
 
 
 def log_telemetry(obs: h5py.Group, act: h5py.Group, t: int, arm: str) -> None:
@@ -231,10 +345,7 @@ def log_telemetry(obs: h5py.Group, act: h5py.Group, t: int, arm: str) -> None:
             rr.log(f"{base}/ee_pos/x", rr.Scalars(float(ee[12])))
             rr.log(f"{base}/ee_pos/y", rr.Scalars(float(ee[13])))
             rr.log(f"{base}/ee_pos/z", rr.Scalars(float(ee[14])))
-        if "dq" in arm_obs:
-            dq = arm_obs["dq"][t]
-            for i, v in enumerate(dq):
-                rr.log(f"{base}/velocity/joint_{i}", rr.Scalars(float(v)))
+        # dq (joint velocities) intentionally not logged — Cartesian twist not available
         if "F_ext" in arm_obs:
             f_ext = arm_obs["F_ext"][t]
             rr.log(f"{base}/contact_force/fx", rr.Scalars(float(f_ext[0])))
@@ -255,19 +366,43 @@ def log_telemetry(obs: h5py.Group, act: h5py.Group, t: int, arm: str) -> None:
             rr.log(f"{base}/gripper/cmd", rr.Scalars(float(arm_act["gripper_cmd"][t])))
 
 
-def _arm_column(arm: str, label: str) -> rrb.Vertical:
-    """Returns a vertical stack of telemetry panels for one arm."""
-    base = f"telemetry/{arm}"
-    return rrb.Vertical(
-        rrb.TimeSeriesView(name=f"{label} · EE pos",        origin=f"{base}/ee_pos"),
-        rrb.TimeSeriesView(name=f"{label} · gripper",       origin=f"{base}/gripper"),
-        rrb.TimeSeriesView(name=f"{label} · velocity",      origin=f"{base}/velocity"),
-        rrb.TimeSeriesView(name=f"{label} · contact force", origin=f"{base}/contact_force"),
-    )
+def log_signals(obs: h5py.Group, t: int, arm: str, speed: Optional[np.ndarray]) -> None:
+    """Logs phase-judgment aid signals for one arm: EE speed and contact-force
+    magnitude. These aren't raw telemetry (that's the right-hand column) —
+    they're derived signals meant to help a human eyeball phase transitions
+    while labeling or reviewing."""
+    side = arm.replace("arm_", "")
+    if speed is not None and t < len(speed):
+        rr.log(f"signals/ee_speed/{side}", rr.Scalars(float(speed[t])))
+
+    arm_obs = obs.get(arm)
+    if arm_obs is not None and "F_ext" in arm_obs:
+        f_ext = arm_obs["F_ext"][t][:3]
+        rr.log(f"signals/contact_force/{side}", rr.Scalars(float(np.linalg.norm(f_ext))))
 
 
-def build_blueprint(cfg: dict, has_wrists: bool) -> rrb.Blueprint:
-    """Returns a Rerun blueprint: cameras left (1/3), telemetry + intent right (2/3)."""
+def labeling_progress_view() -> rrb.TimeSeriesView:
+    """Returns a compact per-arm phase-id strip (0=IDLE..4=PLACE) — a labeling-
+    tool-only view so you can see at a glance which stretches of the episode
+    have been labeled vs. still default/IDLE. Not used in normal playback."""
+    return rrb.TimeSeriesView(name="labeled phase (progress)", origin="labels/phase_id")
+
+
+def build_blueprint(cfg: dict, has_wrists: bool, extra_label_views: Optional[list] = None) -> rrb.Blueprint:
+    """3-column layout: cameras | status + signals + attention | telemetry.
+
+    Phase and target are discrete, low-cardinality states, so they're shown
+    as a plain text table (label summary) rather than stepped timeseries
+    plots — a number is easier to read at a glance than a staircase. Label
+    summary and intent summary sit side by side since they're both compact
+    text panels. EE speed and contact force are added as phase-judgment aids
+    (transport ~ high speed, grasp/place ~ a contact spike) — signals that
+    used to be invisible or dead code. Attention plots get the rest of the
+    column's vertical space.
+
+    extra_label_views lets a caller (e.g. the labeling tool) append its own
+    views to the bottom of this column without duplicating the layout.
+    """
     head_view = rrb.Spatial2DView(name="head camera", origin="camera/primary")
 
     if has_wrists and cfg["camera"].get("show_wrists", True):
@@ -277,32 +412,38 @@ def build_blueprint(cfg: dict, has_wrists: bool) -> rrb.Blueprint:
                 rrb.Spatial2DView(name="wrist left",  origin="camera/wrist_left"),
                 rrb.Spatial2DView(name="wrist right", origin="camera/wrist_right"),
             ),
-            row_shares=[2, 1],
+            row_shares=[3, 2],
         )
     else:
         camera_column = rrb.Vertical(head_view)
 
-    intent_column = rrb.Vertical(
-        rrb.TimeSeriesView(name="intent posterior", origin="intent/posterior"),
-        rrb.TimeSeriesView(name="intent logger belief", origin="intent/logger_belief"),
-        rrb.TimeSeriesView(name="entropy", origin="intent/entropy"),
-    )
-
-    data_column = rrb.Vertical(
+    # ── Status + signals + attention column ─────────────────────────────────
+    extra_label_views = extra_label_views or []
+    label_rows = [
         rrb.Horizontal(
-            _arm_column("arm_left",  "left arm"),
-            _arm_column("arm_right", "right arm"),
+            rrb.TextDocumentView(name="label summary",  origin="labels/summary"),
+            rrb.TextDocumentView(name="intent summary", origin="intent/summary"),
         ),
-        intent_column,
-        row_shares=[3, 2],
+        rrb.TimeSeriesView(name="EE speed",       origin="signals/ee_speed"),
+        rrb.TimeSeriesView(name="contact force",  origin="signals/contact_force"),
+        rrb.TimeSeriesView(name="EE attention",     origin="intent/ee_belief"),
+        rrb.TimeSeriesView(name="target attention", origin="intent/target_belief"),
+        *extra_label_views,
+    ]
+    row_shares = [1, 1.5, 1.5, 2.5, 2.5] + [1.5] * len(extra_label_views)
+    label_column = rrb.Vertical(*label_rows, row_shares=row_shares)
+
+    # ── Telemetry column (compact) ─────────────────────────────────────────
+    telemetry_column = rrb.Vertical(
+        rrb.TimeSeriesView(name="EE pos — left",    origin="telemetry/arm_left/ee_pos"),
+        rrb.TimeSeriesView(name="EE pos — right",   origin="telemetry/arm_right/ee_pos"),
+        rrb.TimeSeriesView(name="gripper — left",   origin="telemetry/arm_left/gripper"),
+        rrb.TimeSeriesView(name="gripper — right",  origin="telemetry/arm_right/gripper"),
+        row_shares=[3, 3, 2, 2],
     )
 
     return rrb.Blueprint(
-        rrb.Horizontal(
-            camera_column,
-            data_column,
-            column_shares=[1, 2],
-        ),
+        rrb.Horizontal(camera_column, label_column, telemetry_column, column_shares=[2, 2, 1.5]),
         collapse_panels=True,
     )
 
@@ -327,7 +468,18 @@ def run(episode_path: Path, cfg: dict, model: Optional[IntentModel]) -> None:
 
         has_wrists = "wrist_cam_left" in imgs and "wrist_cam_right" in imgs
         n_slots = int(intent["n_slots"][0]) if intent and "n_slots" in intent else 0
-        names = candidate_names_from_cfg(cfg, n_slots)
+        names = candidate_names_from_hdf5(intent, n_slots, cfg) if intent is not None else candidate_names_from_cfg(cfg, n_slots)
+
+        seg_data = load_segments(ep)
+        if seg_data is not None:
+            n_segs = len(seg_data["segments"])
+            print(f"Loaded {n_segs} segment(s) from labels/segments")
+
+        speed_arrs = {}
+        for arm in ("arm_left", "arm_right"):
+            arm_obs = obs.get(arm)
+            if arm_obs is not None and "O_T_EE" in arm_obs:
+                speed_arrs[arm] = compute_ee_speed(arm_obs["O_T_EE"][:])
 
         rr.init(f"teleop-intent · episode {episode_id}", spawn=True)
         blueprint = build_blueprint(cfg, has_wrists)
@@ -351,6 +503,7 @@ def run(episode_path: Path, cfg: dict, model: Optional[IntentModel]) -> None:
 
                     if intent is not None:
                         log_gaze(intent, t, cfg, frame.shape, primary_cam)
+                        log_slot_boxes(intent, t, frame.shape, ep, names)
 
                 if has_wrists and cfg["camera"].get("show_wrists", True):
                     if "wrist_cam_left" in imgs:
@@ -360,6 +513,7 @@ def run(episode_path: Path, cfg: dict, model: Optional[IntentModel]) -> None:
 
                 for arm in ("arm_left", "arm_right"):
                     log_telemetry(obs, act, t, arm)
+                    log_signals(obs, t, arm, speed_arrs.get(arm))
 
                 if intent is not None:
                     if model is not None:
@@ -369,12 +523,14 @@ def run(episode_path: Path, cfg: dict, model: Optional[IntentModel]) -> None:
                             n = int(intent["n_slots"][t]) if "n_slots" in intent else len(pred.object_posterior)
                             mask = np.zeros(len(pred.object_posterior), dtype=bool)
                             mask[:n] = True
-                            log_intent_posterior(
-                                pred.object_posterior, mask, names,
-                                pred.object_entropy(), t,
-                            )
+                            log_intent_posterior(pred.object_posterior, mask, names, pred.object_entropy(), t)
                     else:
                         log_belief_from_hdf5(intent, t, names)
+                    if intent is not None:
+                        log_intent_summary(intent, t)
+
+                if seg_data is not None:
+                    log_label_signals(seg_data, t)
 
                 sleep = frame_dt - (time.time() - t0_wall - ts_s)
                 if sleep > 0:
@@ -387,22 +543,13 @@ def run(episode_path: Path, cfg: dict, model: Optional[IntentModel]) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    ap.add_argument("--episode", required=True,
-                    help="Episode folder name, e.g. 076")
-    ap.add_argument("--config", default="configs/playback.yaml",
-                    help="Path to playback config YAML")
-    ap.add_argument("--camera", default=None,
-                    help="Override camera.primary from config")
-    ap.add_argument("--no-gaze", action="store_true",
-                    help="Disable gaze overlay regardless of config")
-    ap.add_argument("--model", default=None,
-                    help="Override model.name, e.g. models.bayesian.BayesianFilter")
-    ap.add_argument("--checkpoint", default=None,
-                    help="Override model.checkpoint path")
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--episode", required=True, help="Episode folder name, e.g. 076")
+    ap.add_argument("--config", default="configs/playback.yaml", help="Path to playback config YAML")
+    ap.add_argument("--camera", default=None, help="Override camera.primary from config")
+    ap.add_argument("--no-gaze", action="store_true", help="Disable gaze overlay regardless of config")
+    ap.add_argument("--model", default=None, help="Override model.name, e.g. models.bayesian.BayesianFilter")
+    ap.add_argument("--checkpoint", default=None, help="Override model.checkpoint path")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -415,14 +562,10 @@ def main() -> None:
                 dataset_cfg = yaml.safe_load(f)
             cfg["data"]["store_root"] = dataset_cfg["data"]["store_root"]
 
-    if args.camera:
-        cfg["camera"]["primary"] = args.camera
-    if args.no_gaze:
-        cfg["gaze"]["show"] = False
-    if args.model:
-        cfg["model"]["name"] = args.model
-    if args.checkpoint:
-        cfg["model"]["checkpoint"] = args.checkpoint
+    if args.camera: cfg["camera"]["primary"] = args.camera
+    if args.no_gaze: cfg["gaze"]["show"] = False
+    if args.model: cfg["model"]["name"] = args.model
+    if args.checkpoint: cfg["model"]["checkpoint"] = args.checkpoint
 
     model = load_model(cfg)
     episode_path = resolve_episode_path(cfg, args.episode)

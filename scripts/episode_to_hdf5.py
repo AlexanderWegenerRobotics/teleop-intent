@@ -205,28 +205,65 @@ def load_intent(folder, grid):
     Loads intention_log.csv and resamples it onto grid (int64 ns timestamps).
     Returns a dict of {col_name: array[T]} using nearest-neighbor alignment on
     timestamp_arrival_ns.  Returns None if the file is absent or unreadable.
+
+    Columns starting with 'slot_name_' are string-valued and are returned as
+    numpy arrays of dtype object (str).  All other columns are float64.
     """
+    import csv as _csv
+
     path = os.path.join(folder, "intention_log.csv")
     if not os.path.exists(path):
         return None
 
-    with open(path) as f:
-        hdr = f.readline().strip().split(";")
-    data = np.genfromtxt(path, delimiter=";", skip_header=1)
-    if data.ndim == 1:
-        data = data.reshape(1, -1)
-    if data.shape[0] == 0 or "timestamp_arrival_ns" not in hdr:
+    with open(path, newline="") as f:
+        reader = _csv.reader(f, delimiter=";")
+        hdr = next(reader)
+        rows = list(reader)
+
+    if not rows or "timestamp_arrival_ns" not in hdr:
         return None
 
-    ts = data[:, hdr.index("timestamp_arrival_ns")].astype(np.int64)
+    # Identify which column indices are string vs numeric
+    str_cols = {i for i, col in enumerate(hdr) if col.startswith("slot_name_")}
+
+    # Build per-column arrays
+    n_rows = len(rows)
+    numeric_data = {}  # col_idx -> list[float]
+    string_data  = {}  # col_idx -> list[str]
+    for i, col in enumerate(hdr):
+        if i in str_cols:
+            string_data[i] = []
+        else:
+            numeric_data[i] = []
+
+    for row in rows:
+        for i, val in enumerate(row):
+            if i >= len(hdr):
+                break
+            if i in str_cols:
+                string_data[i].append(val.strip())
+            else:
+                try:
+                    numeric_data[i].append(float(val))
+                except ValueError:
+                    numeric_data[i].append(float("nan"))
+
+    # Convert to numpy
+    num_arrays = {i: np.array(v, dtype=np.float64) for i, v in numeric_data.items()}
+    str_arrays = {i: np.array(v, dtype=object)     for i, v in string_data.items()}
+
+    ts_idx = hdr.index("timestamp_arrival_ns")
+    ts  = num_arrays[ts_idx].astype(np.int64)
     sel = nearest_idx(ts, grid)
 
     out = {}
-    for col in hdr:
+    for i, col in enumerate(hdr):
         if col in ("time",):
             continue
-        idx = hdr.index(col)
-        out[col] = data[:, idx][sel]
+        if i in str_cols:
+            out[col] = str_arrays[i][sel]
+        else:
+            out[col] = num_arrays[i][sel]
     return out
 
 
@@ -434,9 +471,15 @@ def convert(folder, out_path, rate, scale, cameras, camera_params_path=None):
                 return arr
 
             ig = obs.create_group("intent")
+            dt_str = h5py.string_dtype()  # variable-length UTF-8 strings
             for col, arr in intent.items():
-                ig.create_dataset(col, data=_norm_intent_col(col, arr).astype(np.float32)
-                                  if arr.dtype.kind == "f" else arr)
+                if arr.dtype.kind in ("U", "O"):
+                    # String column (e.g. slot_name_*): store as variable-length strings
+                    ig.create_dataset(col, data=arr.astype(str), dtype=dt_str)
+                elif arr.dtype.kind == "f":
+                    ig.create_dataset(col, data=_norm_intent_col(col, arr).astype(np.float32))
+                else:
+                    ig.create_dataset(col, data=arr)
             ig.attrs["px_normalized"]      = True
             ig.attrs["gaze_px_ref_width"]  = int(full_stereo_w) if full_stereo_w else 0
             ig.attrs["gaze_px_ref_height"] = int(full_stereo_h) if full_stereo_h else 0
