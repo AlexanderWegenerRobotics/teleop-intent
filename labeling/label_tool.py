@@ -14,7 +14,8 @@ that's a fragile foundation.
 
 Instead this is one self-contained window: a single process draws the video
 frame (with gaze dot + slot boxes burned in via PIL) and small context plots
-(EE speed, contact force, EE attention) with a moving cursor line, all from
+(EE speed, contact force, gripper width/cmd, EE attention, plus your own
+labeled-phase/labeled-target progress) with a moving cursor line, all from
 the same scrub position. There is nothing to keep in sync because there is
 only one source of truth. viz/playback.py (Rerun) remains the tool for rich
 multi-view review; this tool is only for producing labels.
@@ -57,7 +58,7 @@ except ImportError:
 
 try:
     from matplotlib.figure import Figure
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 except ImportError:
     sys.exit("matplotlib is required: pip install matplotlib")
 
@@ -75,7 +76,7 @@ from common import (  # noqa: E402
 )
 
 SIDES = ("left", "right")
-DISPLAY_SCALE = 1.5  # upscale the (small, downsampled) stored frame for visibility
+DISPLAY_SCALE = 2.8  # upscale the (small, downsampled) stored frame for visibility
 
 
 # ---------------------------------------------------------------------------
@@ -227,8 +228,11 @@ class EpisodeSession:
         # -- context-plot signals: cheap scalar arrays, load fully upfront --
         self.speed: dict[str, np.ndarray] = {}
         self.contact_force: dict[str, np.ndarray] = {}
+        self.gripper_width: dict[str, np.ndarray] = {}
+        self.gripper_cmd: dict[str, np.ndarray] = {}
         for side in SIDES:
             arm_obs = self.obs.get(f"arm_{side}")
+            arm_act = self.act.get(f"arm_{side}") if self.act is not None else None
             if arm_obs is not None and "O_T_EE" in arm_obs:
                 self.speed[side] = compute_ee_speed(arm_obs["O_T_EE"][:])
             else:
@@ -237,6 +241,12 @@ class EpisodeSession:
                 self.contact_force[side] = np.linalg.norm(arm_obs["F_ext"][:, :3], axis=1)
             else:
                 self.contact_force[side] = np.zeros(self.T)
+            self.gripper_width[side] = (arm_obs["gripper_width"][:]
+                                        if arm_obs is not None and "gripper_width" in arm_obs
+                                        else np.zeros(self.T))
+            self.gripper_cmd[side] = (arm_act["gripper_cmd"][:]
+                                      if arm_act is not None and "gripper_cmd" in arm_act
+                                      else np.zeros(self.T))
 
         self.ee_belief: Optional[dict[str, np.ndarray]] = None
         if self.intent is not None and "ee_belief_ee_left" in self.intent and "ee_belief_ee_right" in self.intent:
@@ -261,6 +271,34 @@ class EpisodeSession:
                 self.target[side] = ["null"] * self.T
 
         self._history: list[tuple] = []  # undo stack of (side, phase_copy, target_copy)
+
+    def auto_start(self, side: str, before_t: int) -> int:
+        """Returns where the next 'Apply to range' should start from: the
+        frame right after the nearest already-labeled frame *strictly before*
+        before_t, or 0 if nothing before it is labeled.
+
+        This is computed fresh from the actual label arrays every time,
+        rather than tracked as a single "furthest labeled" pointer — a
+        single global pointer breaks the moment you jump around labeling
+        different stretches out of order (e.g. going back to fix an early
+        segment after already labeling near the end): the pointer stays
+        pinned far ahead, so scrubbing back to work locally looks like
+        you're "behind" your own progress and either blocks you or, worse,
+        silently overwrites everything in between if it doesn't check
+        direction. Searching backward from wherever you currently are
+        instead always proposes the locally-correct gap to fill, and by
+        construction the result can never exceed before_t, so the "current
+        frame is before the start" failure mode this used to hit is
+        structurally impossible now.
+        """
+        before_t = max(0, min(self.T, before_t))
+        if before_t == 0:
+            return 0
+        phase_labeled = self.phase[side][:before_t] != 0
+        target_labeled = np.array(self.target[side][:before_t]) != "null"
+        labeled = phase_labeled | target_labeled
+        nz = np.nonzero(labeled)[0]
+        return int(nz[-1]) + 1 if len(nz) else 0
 
     def close(self) -> None:
         self.ep.close()
@@ -291,8 +329,22 @@ class EpisodeSession:
         self.target[side] = target_copy
         return side
 
+    def clear_labels(self, side: str) -> None:
+        """Zeros out every existing label for one arm across the whole
+        episode: phase -> IDLE, target -> null. Meant for wiping out messy
+        old labels before relabeling from scratch. Snapshotted like any
+        other edit, so it's undoable."""
+        self.snapshot(side)
+        self.phase[side][:] = PHASE_IDS["IDLE"]
+        self.target[side] = ["null"] * self.T
+
     def apply_range(self, side: str, lo: int, hi: int, phase_name: str, target_name: str) -> None:
-        lo, hi = sorted((max(0, lo), min(self.T - 1, hi)))
+        # Clamp each bound into [0, T-1] individually *before* sorting — if
+        # only hi were clamped, a lo past the end of the episode could end
+        # up as the unclamped "hi" after sorting and corrupt the range.
+        lo = max(0, min(self.T - 1, lo))
+        hi = max(0, min(self.T - 1, hi))
+        lo, hi = sorted((lo, hi))
         self.snapshot(side)
         self.phase[side][lo:hi + 1] = PHASE_IDS[phase_name]
         for t in range(lo, hi + 1):
@@ -348,15 +400,30 @@ class ContextPlots:
         # Single column, one row per signal — simpler to make genuinely
         # bigger/readable than a cramped grid, and keeps "labeled phase" and
         # "labeled target" as two distinct, equally prominent panels.
-        self.fig = Figure(figsize=(5.4, 7.6), dpi=92)
-        gs = self.fig.add_gridspec(5, 1, height_ratios=[1, 1, 1, 1.2, 1.4])
-        self.ax_speed  = self.fig.add_subplot(gs[0])
-        self.ax_force  = self.fig.add_subplot(gs[1], sharex=self.ax_speed)
-        self.ax_belief = self.fig.add_subplot(gs[2], sharex=self.ax_speed)
-        self.ax_phase  = self.fig.add_subplot(gs[3], sharex=self.ax_speed)
-        self.ax_target = self.fig.add_subplot(gs[4], sharex=self.ax_speed)
+        # figsize is just the initial size — packed with fill="both",
+        # expand=True in a frame with no fixed width, the canvas resizes to
+        # fill whatever space is actually available (see LabelToolApp). Wide
+        # but not tall: height is what was pushing the arm-panel controls
+        # off the bottom of the window.
+        self.fig = Figure(figsize=(7.6, 6.2), dpi=92)
+        gs = self.fig.add_gridspec(6, 1, height_ratios=[1, 1, 1, 1, 1.2, 1.4])
+        self.ax_speed   = self.fig.add_subplot(gs[0])
+        self.ax_force   = self.fig.add_subplot(gs[1], sharex=self.ax_speed)
+        self.ax_gripper = self.fig.add_subplot(gs[2], sharex=self.ax_speed)
+        self.ax_belief  = self.fig.add_subplot(gs[3], sharex=self.ax_speed)
+        self.ax_phase   = self.fig.add_subplot(gs[4], sharex=self.ax_speed)
+        self.ax_target  = self.fig.add_subplot(gs[5], sharex=self.ax_speed)
         self.canvas = FigureCanvasTkAgg(self.fig, master=parent)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+
+        # Standard matplotlib zoom/pan toolbar. Zooming the x-range on any
+        # one panel zooms all of them together for free, since they all
+        # share their x-axis (sharex=self.ax_speed above) — matplotlib keeps
+        # linked axes' x-limits in sync automatically.
+        self.toolbar = NavigationToolbar2Tk(self.canvas, parent, pack_toolbar=False)
+        self.toolbar.update()
+        self.toolbar.pack(side="bottom", fill="x")
+
         self.cursors: dict = {}
         self._t = 0
 
@@ -372,13 +439,21 @@ class ContextPlots:
         self._style(self.ax_speed, "EE speed")
         self.ax_speed.plot(x, session.speed["left"], linewidth=0.7, label="left")
         self.ax_speed.plot(x, session.speed["right"], linewidth=0.7, label="right")
-        self.ax_speed.legend(fontsize=8, loc="upper right")
+        self.ax_speed.legend(fontsize=8, loc="upper left")
         self.cursors["speed"] = self.ax_speed.axvline(0, color="black", linewidth=1, linestyle="--")
 
         self._style(self.ax_force, "contact force")
         self.ax_force.plot(x, session.contact_force["left"], linewidth=0.7)
         self.ax_force.plot(x, session.contact_force["right"], linewidth=0.7)
         self.cursors["force"] = self.ax_force.axvline(0, color="black", linewidth=1, linestyle="--")
+
+        self._style(self.ax_gripper, "gripper (solid=width, dashed=cmd)")
+        self.ax_gripper.plot(x, session.gripper_width["left"], linewidth=0.9, color="C0", label="left")
+        self.ax_gripper.plot(x, session.gripper_cmd["left"], linewidth=0.9, color="C0", linestyle="--")
+        self.ax_gripper.plot(x, session.gripper_width["right"], linewidth=0.9, color="C1", label="right")
+        self.ax_gripper.plot(x, session.gripper_cmd["right"], linewidth=0.9, color="C1", linestyle="--")
+        self.ax_gripper.legend(fontsize=8, loc="upper left")
+        self.cursors["gripper"] = self.ax_gripper.axvline(0, color="black", linewidth=1, linestyle="--")
 
         self._style(self.ax_belief, "EE attention")
         if session.ee_belief is not None:
@@ -393,7 +468,15 @@ class ContextPlots:
     def update_labels(self, session: EpisodeSession, redraw: bool = True) -> None:
         """Redraws just the labeled-phase and labeled-target panels from
         current in-memory state — call this after every edit (apply_range,
-        set_here, undo) so labeling progress is visible as you go."""
+        set_here, undo) so labeling progress is visible as you go.
+
+        Preserves whatever x-zoom is currently active: _style() clears the
+        axes (ax.cla()), and re-plotting fresh data onto a cleared axes
+        autoscales it back to the full range — which, because all six
+        panels share their x-axis, would silently reset your zoom on
+        *every* panel on every single label edit if left alone.
+        """
+        xlim = self.ax_speed.get_xlim()
         x = np.arange(session.T)
 
         self._style(self.ax_phase, "labeled phase")
@@ -401,7 +484,7 @@ class ContextPlots:
         self.ax_phase.plot(x, session.phase["right"], linewidth=0.8, drawstyle="steps-post", label="right")
         self.ax_phase.set_yticks(list(PHASE_NAMES.keys()))
         self.ax_phase.set_yticklabels(list(PHASE_NAMES.values()), fontsize=8)
-        self.ax_phase.legend(fontsize=8, loc="upper right")
+        self.ax_phase.legend(fontsize=8, loc="upper left")
         self.cursors["phase"] = self.ax_phase.axvline(self._t, color="black", linewidth=1, linestyle="--")
 
         names = ["null"] + session.target_names
@@ -413,8 +496,14 @@ class ContextPlots:
                             linewidth=0.8, drawstyle="steps-post", label="right")
         self.ax_target.set_yticks(range(len(names)))
         self.ax_target.set_yticklabels(names, fontsize=8)
-        self.ax_target.legend(fontsize=8, loc="upper right")
+        self.ax_target.legend(fontsize=8, loc="upper left")
         self.cursors["target"] = self.ax_target.axvline(self._t, color="black", linewidth=1, linestyle="--")
+
+        # Re-applying to any one shared-x axes re-syncs the whole group —
+        # a no-op on first load (xlim was just captured from the same
+        # freshly-autoscaled data), but restores your zoom on every
+        # subsequent call.
+        self.ax_speed.set_xlim(xlim)
 
         if redraw:
             self.fig.tight_layout()
@@ -452,18 +541,20 @@ class ArmPanel(ttk.LabelFrame):
         self.target_combo = ttk.Combobox(target_row, textvariable=self.target_var, state="readonly", width=14)
         self.target_combo.pack(side="left", padx=4)
 
-        self.start_var = tk.StringVar(value="start: —")
+        self.start_var = tk.StringVar(value="continues from: 0")
         btn_row = ttk.Frame(self)
         btn_row.pack(fill="x")
-        ttk.Button(btn_row, text="Mark start", command=self.mark_start).pack(side="left")
-        ttk.Label(btn_row, textvariable=self.start_var).pack(side="left", padx=6)
-        ttk.Button(btn_row, text="Apply to range", command=self.apply_range).pack(side="left", padx=4)
-        ttk.Button(btn_row, text="Set this frame", command=self.set_here).pack(side="left")
+        ttk.Button(btn_row, text="Start new segment here", command=self.mark_start).pack(side="left")
+        ttk.Button(btn_row, text="Label to here", command=self.apply_range).pack(side="left", padx=4)
+        self.start_label = ttk.Label(btn_row, textvariable=self.start_var)
+        self.start_label.pack(side="left", padx=6)
+        ttk.Button(btn_row, text="Set this frame only", command=self.set_here).pack(side="left")
+        ttk.Button(btn_row, text="Clear all labels for this arm", command=self.clear_labels).pack(side="left", padx=(20, 0))
 
         self.readout_var = tk.StringVar(value="—")
         ttk.Label(self, textvariable=self.readout_var, foreground="#555").pack(anchor="w", pady=(4, 0))
 
-        self._start_t: Optional[int] = None
+        self._start_t: Optional[int] = None  # explicit segment start; None = auto-continue
 
     def set_target_options(self, names: list[str]) -> None:
         opts = ["null"] + names
@@ -472,17 +563,45 @@ class ArmPanel(ttk.LabelFrame):
             self.target_var.set("null")
 
     def mark_start(self) -> None:
+        """Pins the start of the next 'Label to here' to the current frame.
+
+        You need this whenever the segment you're about to label doesn't
+        start right where your last one ended — most commonly, after an
+        idle/rest stretch between two pick-place actions. Those gaps are
+        real and should stay unlabeled (IDLE is the default), so "Label to
+        here" deliberately won't reach back across one on its own: doing
+        that automatically would silently swallow the idle gap into
+        whatever phase you label next. Within one continuous action
+        (APPROACH -> GRASP -> TRANSPORT -> PLACE, no gaps between them) you
+        don't need this — "Label to here" already continues from your last
+        labeled frame by itself.
+        """
         if self.app.session is None:
             return
         self._start_t = self.app.current_t
-        self.start_var.set(f"start: {self._start_t}")
+        self.start_var.set(f"starts at: {self._start_t} (set)")
+
+    def _auto_start(self) -> int:
+        """Where 'Label to here' would start from right now: the nearest
+        already-labeled frame before the current one, plus one. Computed
+        fresh from the actual label data each time (session.auto_start), so
+        it's always correct for wherever you're currently scrubbed to —
+        whether that's continuing forward past your furthest progress or
+        jumping back to fill a gap earlier in the episode."""
+        return self.app.session.auto_start(self.side, self.app.current_t)
 
     def apply_range(self) -> None:
+        """Labels from your last labeled frame (or from 'Start new segment
+        here', if you clicked it) through the current frame. This is the
+        one click you need for every phase transition *within* one
+        continuous action; 'Start new segment here' is the one extra click
+        needed only when there's a real gap before this segment."""
         if self.app.session is None:
             return
-        lo = self._start_t if self._start_t is not None else self.app.current_t
         hi = self.app.current_t
+        lo = self._start_t if self._start_t is not None else self._auto_start()
         self.app.session.apply_range(self.side, lo, hi, self.phase_var.get(), self.target_var.get())
+        self._start_t = None  # consumed; next click auto-continues from here again
         self.app.on_labels_changed()
 
     def set_here(self) -> None:
@@ -492,8 +611,28 @@ class ArmPanel(ttk.LabelFrame):
         self.app.session.apply_range(self.side, t, t, self.phase_var.get(), self.target_var.get())
         self.app.on_labels_changed()
 
+    def clear_labels(self) -> None:
+        """Wipes every existing label for this arm (whole episode) back to
+        IDLE / null. For cleaning up old/messy labels before relabeling —
+        confirmed first since it touches the full episode, not just a
+        range, and undo only remembers the last 30 edits."""
+        if self.app.session is None:
+            return
+        if not messagebox.askyesno(
+            "Clear all labels",
+            f"Clear ALL {self.side}-arm labels for this episode?\n"
+            "Phase -> IDLE, target -> null, for every frame.\n"
+            "This can be undone with Undo right after, but not later.",
+        ):
+            return
+        self.app.session.clear_labels(self.side)
+        self._start_t = None
+        self.app.on_labels_changed()
+
     def update_readout(self, phase_id: int, target_name: str) -> None:
         self.readout_var.set(f"current frame: {PHASE_NAMES.get(phase_id, '?')} / {target_name}")
+        if self._start_t is None and self.app.session is not None:
+            self.start_var.set(f"continues from: {self._auto_start()}")
 
 
 class LabelToolApp:
@@ -507,12 +646,12 @@ class LabelToolApp:
         self._photo = None  # keep a reference — Tk drops the image otherwise
 
         root.title("teleop-intent — manual labeling")
-        root.geometry("1300x1040")
-        root.minsize(1150, 980)
+        root.geometry("1780x1050")
+        root.minsize(1600, 1000)
 
-        # -- episode picker --
+        # -- episode picker (top) --
         top = ttk.Frame(root, padding=8)
-        top.pack(fill="x")
+        top.pack(side="top", fill="x")
         ttk.Label(top, text="episode:").pack(side="left")
         episode_ids = load_episode_list()
         labels = [episode_label(e) for e in episode_ids]
@@ -525,25 +664,25 @@ class LabelToolApp:
         self.status_var = tk.StringVar(value="no episode loaded")
         ttk.Label(top, textvariable=self.status_var, foreground="#555").pack(side="left", padx=8)
 
-        # -- main content: video canvas (left) + context plots (right) --
-        content = ttk.Frame(root, padding=8)
-        content.pack(fill="both", expand=True)
-        video_frame = ttk.Frame(content)
-        video_frame.pack(side="left", fill="both", expand=True)
-        self.video_label = ttk.Label(video_frame)
-        self.video_label.pack()
-        self.label_text_var = tk.StringVar(value="")
-        ttk.Label(video_frame, textvariable=self.label_text_var, font=("Courier", 11),
-                  justify="left").pack(anchor="w", pady=(6, 0))
+        # -- everything below is packed side="bottom", in reverse visual
+        # order, and BEFORE the video/plots area. That reserves their space
+        # first no matter how tall the plots want to be, so the controls can
+        # never get pushed off the bottom of the window again — previously
+        # the expanding video+plots area was packed first and could grow to
+        # claim the whole window, leaving these with nowhere to go.
+        ttk.Label(root, text="←/→ step 1   shift+←/→ step 10   space play/pause   ctrl+s save   ctrl+z undo",
+                  foreground="#888").pack(side="bottom", pady=4)
 
-        plots_frame = ttk.Frame(content, width=520)
-        plots_frame.pack(side="left", fill="y", padx=(10, 0))
-        plots_frame.pack_propagate(False)
-        self.context_plots = ContextPlots(plots_frame)
+        # -- per-arm panels --
+        panels = ttk.Frame(root, padding=8)
+        panels.pack(side="bottom", fill="x")
+        self.arm_panels = {side: ArmPanel(panels, side, self) for side in SIDES}
+        for p in self.arm_panels.values():
+            p.pack(side="left", fill="x", expand=True, padx=4)
 
         # -- scrubber --
         scrub = ttk.Frame(root, padding=8)
-        scrub.pack(fill="x")
+        scrub.pack(side="bottom", fill="x")
         self.frame_var = tk.IntVar(value=0)
         self.scale = ttk.Scale(scrub, from_=0, to=1, orient="horizontal",
                                variable=self.frame_var, command=self._on_scale)
@@ -559,15 +698,27 @@ class LabelToolApp:
         ttk.Button(ctrl, text="Undo", command=self.undo).pack(side="right")
         ttk.Button(ctrl, text="Save", command=self.save).pack(side="right", padx=4)
 
-        # -- per-arm panels --
-        panels = ttk.Frame(root, padding=8)
-        panels.pack(fill="x")
-        self.arm_panels = {side: ArmPanel(panels, side, self) for side in SIDES}
-        for p in self.arm_panels.values():
-            p.pack(side="left", fill="x", expand=True, padx=4)
+        # -- main content: video canvas (left) + context plots (right) —
+        # packed LAST so it only fills whatever's left above the reserved
+        # controls, instead of claiming the whole window and pushing them out.
+        content = ttk.Frame(root, padding=8)
+        content.pack(side="top", fill="both", expand=True)
+        video_frame = ttk.Frame(content)
+        video_frame.pack(side="left", fill="y")
+        self.video_label = ttk.Label(video_frame)
+        self.video_label.pack()
+        self.label_text_var = tk.StringVar(value="")
+        ttk.Label(video_frame, textvariable=self.label_text_var, font=("Courier", 11),
+                  justify="left").pack(anchor="w", pady=(6, 0))
 
-        ttk.Label(root, text="←/→ step 1   shift+←/→ step 10   space play/pause   ctrl+s save   ctrl+z undo",
-                  foreground="#888").pack(side="bottom", pady=4)
+        # No fixed width / pack_propagate here on purpose: this frame fills
+        # whatever space is left after the video column (which just hugs its
+        # own fixed image size), and the embedded matplotlib canvas resizes
+        # to fill it — so the plots use all the leftover width automatically,
+        # including on window resize, without hand-tuning a pixel width.
+        plots_frame = ttk.Frame(content)
+        plots_frame.pack(side="left", fill="both", expand=True, padx=(10, 0))
+        self.context_plots = ContextPlots(plots_frame)
 
         root.bind("<Left>", lambda e: self.step(-1))
         root.bind("<Right>", lambda e: self.step(1))
