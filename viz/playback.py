@@ -481,7 +481,10 @@ def run(episode_path: Path, cfg: dict, model: Optional[IntentModel]) -> None:
             if arm_obs is not None and "O_T_EE" in arm_obs:
                 speed_arrs[arm] = compute_ee_speed(arm_obs["O_T_EE"][:])
 
-        rr.init(f"teleop-intent · episode {episode_id}", spawn=True)
+        rr.init(f"teleop-intent · episode {episode_id}", spawn=not args.save)
+        if args.save:
+            rr.save(args.save)
+            print(f"Saving recording to {args.save}")
         blueprint = build_blueprint(cfg, has_wrists)
         rr.send_blueprint(blueprint)
 
@@ -550,6 +553,8 @@ def main() -> None:
     ap.add_argument("--no-gaze", action="store_true", help="Disable gaze overlay regardless of config")
     ap.add_argument("--model", default=None, help="Override model.name, e.g. models.bayesian.BayesianFilter")
     ap.add_argument("--checkpoint", default=None, help="Override model.checkpoint path")
+    ap.add_argument("--save", metavar="FILE", nargs="?", const="recording.rrd",
+                    help="Save recording to .rrd file instead of spawning viewer (default: recording.rrd)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
