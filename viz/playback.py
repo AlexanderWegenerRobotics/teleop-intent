@@ -56,9 +56,12 @@ from common import (  # noqa: E402
     compute_ee_speed,
     compute_gaze_px,
     compute_slot_boxes,
+    project_slot_positions,
     load_config,
 )
-from models.base import CandidateFeatures, IntentModel, IntentPrediction
+from models.base import IntentModel
+from teleop_orchestrator.contracts import IntentOutput, Phase
+from teleop_orchestrator.sources import ReplaySource
 
 
 def resolve_episode_path(cfg: dict, episode_id: str) -> Path:
@@ -84,58 +87,17 @@ def load_model(cfg: dict) -> Optional[IntentModel]:
     return model
 
 
-def build_candidate_features(intent: h5py.Group, t: int) -> Optional[CandidateFeatures]:
-    """Extracts CandidateFeatures for timestep t from the intent group."""
-    if "n_slots" not in intent:
-        return None
-    n_slots = int(intent["n_slots"][t])
-    if n_slots == 0:
-        return None
-
-    feature_keys = [
-        k for k in intent.keys()
-        if k.startswith("slot_dist_") or k.startswith("slot_px_") or
-           k.startswith("ee_") or k.startswith("gripper_")
-    ]
-    feature_vecs = []
-    for k in sorted(feature_keys):
-        arr = intent[k][t]
-        feature_vecs.append(np.atleast_1d(arr).astype(np.float32))
-
-    if not feature_vecs:
-        return None
-
-    max_n = feature_vecs[0].shape[0]
-    features = np.stack(feature_vecs, axis=-1)[:max_n]
-    mask = np.zeros(max_n, dtype=bool)
-    mask[:n_slots] = True
-
-    slot_types = intent["slot_type_0"][t:t+1] if "slot_type_0" in intent else np.zeros(max_n)
-    candidate_types = np.zeros(max_n, dtype=np.int32)
-
-    gaze_valid = bool(intent["gaze_valid"][t]) if "gaze_valid" in intent else True
-    ts = int(intent["timestamp_arrival_ns"][t]) if "timestamp_arrival_ns" in intent else 0
-
-    return CandidateFeatures(
-        features=features,
-        mask=mask,
-        candidate_types=candidate_types,
-        timestamp_ns=ts,
-        gaze_valid=gaze_valid,
-    )
-
-
 def log_camera(name: str, frame: np.ndarray, path: str) -> None:
     """Logs one camera frame to a Rerun image entity."""
     rr.log(path, rr.Image(frame))
 
 
-def log_gaze(intent: h5py.Group, t: int, cfg: dict, img_shape: tuple, camera: str) -> None:
+def log_gaze(intent: h5py.Group, t: int, cfg: dict, img_shape: tuple, camera: str, ep: h5py.File) -> None:
     """Logs the gaze point as a 2D point overlay on the primary camera.
     Pixel math lives in common.compute_gaze_px — shared with the standalone
     labeler so the two tools can never disagree on where the dot goes.
     """
-    gp = compute_gaze_px(intent, t, cfg, img_shape)
+    gp = compute_gaze_px(intent, t, cfg, img_shape, ep=ep)
     if gp is None:
         return
     gx, gy = gp
@@ -176,21 +138,60 @@ def log_slot_boxes(intent: h5py.Group, t: int, img_shape: tuple, ep_file: h5py.F
         ))
 
 
-def log_intent_posterior(
-    posterior: np.ndarray,
-    mask: np.ndarray,
-    names: list[str],
-    entropy: float,
-    t: int,
-) -> None:
-    """Logs per-candidate intent posteriors and entropy as Rerun scalars."""
-    for i, (p, valid) in enumerate(zip(posterior, mask)):
-        if not valid:
-            continue
-        label = names[i] if i < len(names) else f"slot_{i}"
-        rr.log(f"intent/posterior/{label}", rr.Scalars(float(p)))
+def log_model_slot_boxes(intent: h5py.Group, t: int, img_shape: tuple, ep_file: h5py.File,
+                          pickplace_names: list[str], out: IntentOutput, mask: np.ndarray) -> None:
+    """Overlays pick/place candidate boxes colored by a live model's
+    target_posterior, one set per arm — distinct Rerun paths from
+    log_slot_boxes' hdf5-belief-colored boxes, so both are visible at once
+    for comparison. End-effectors aren't shown here: the model doesn't
+    predict EE attention, only target.
+    """
+    positions = project_slot_positions(intent, t, ep_file, img_shape)
+    n_ee = 2  # ee_left, ee_right occupy joint slot indices 0-1; candidates start at 2
+    box_half = 12.0
+    side_colors = {"left": (80, 160, 255), "right": (255, 150, 60)}  # blue / orange, distinct from baseline's red-ish
 
-    rr.log("intent/entropy", rr.Scalars(entropy))
+    for side in ("left", "right"):
+        ai = out.arm(side)
+        boxes = []
+        for i, valid in enumerate(mask):
+            if not valid:
+                continue
+            joint_idx = i + n_ee
+            if joint_idx >= len(positions) or positions[joint_idx] is None:
+                continue
+            u, v = positions[joint_idx]
+            label = pickplace_names[i] if i < len(pickplace_names) else f"slot_{i}"
+            boxes.append({"u": u, "v": v, "belief": float(ai.target_posterior[i]), "label": label})
+        if not boxes:
+            continue
+        r, g, b = side_colors[side]
+        max_b = max(box["belief"] for box in boxes) or 1.0
+        colors = [[r, g, b, int(80 + 175 * (box["belief"] / max_b if max_b > 1e-6 else 0.0))] for box in boxes]
+        rr.log(f"camera/primary/slots_model_{side}", rr.Boxes2D(
+            centers=[[box["u"], box["v"]] for box in boxes],
+            half_sizes=[[box_half, box_half]] * len(boxes),
+            colors=colors, labels=[f"{box['label']} ({side[0]})" for box in boxes],
+        ))
+
+
+def log_intent_output(out: IntentOutput, pickplace_names: list[str], mask: np.ndarray, t: int) -> None:
+    """Logs a live model's per-arm phase/target posteriors and entropy as Rerun scalars.
+
+    pickplace_names/mask describe the candidate axis (end-effectors excluded,
+    per contracts.features) — the same names list playback already builds for
+    slot-box overlays, minus its first two (ee_left, ee_right) entries.
+    """
+    for side in ("left", "right"):
+        ai = out.arm(side)
+        for i, (p, valid) in enumerate(zip(ai.target_posterior, mask)):
+            if not valid:
+                continue
+            label = pickplace_names[i] if i < len(pickplace_names) else f"slot_{i}"
+            rr.log(f"intent/{side}/target/{label}", rr.Scalars(float(p)))
+        rr.log(f"intent/{side}/target_entropy", rr.Scalars(ai.target_entropy()))
+        rr.log(f"intent/{side}/phase", rr.Scalars(float(ai.top_phase())))
+        rr.log(f"intent/{side}/phase_entropy", rr.Scalars(ai.phase_entropy()))
 
 
 def log_belief_from_hdf5(intent: h5py.Group, t: int, names: list[str]) -> None:
@@ -221,8 +222,24 @@ def log_belief_from_hdf5(intent: h5py.Group, t: int, names: list[str]) -> None:
             rr.log(f"intent/logger_belief/{label}", rr.Scalars(float(intent[k][t])))
 
 
-def log_intent_summary(intent: h5py.Group, t: int) -> None:
-    """Logs a text panel showing the highest-attention EE and target with probabilities."""
+def log_intent_summary(intent: h5py.Group, t: int, model_out: Optional[IntentOutput] = None,
+                        pickplace_names: Optional[list[str]] = None) -> None:
+    """Logs a text panel: the live model's prediction (if one is running)
+    first, then the hdf5's own baseline filter belief for comparison — never
+    the other way around, so it's never ambiguous which is which."""
+    lines = []
+
+    if model_out is not None:
+        names = pickplace_names or []
+        for side in ("left", "right"):
+            ai = model_out.arm(side)
+            phase_name = Phase.NAMES.get(ai.top_phase(), "?")
+            tgt_idx = ai.top_target()
+            tgt_name = names[tgt_idx] if tgt_idx < len(names) else f"slot_{tgt_idx}"
+            lines.append(f"[model] {side:<5} phase={phase_name:<9} target={tgt_name:<10} "
+                         f"H={ai.target_entropy():.2f}")
+        lines.append("")
+
     has_split = any(k.startswith("ee_belief_") for k in intent.keys())
 
     if has_split:
@@ -241,14 +258,14 @@ def log_intent_summary(intent: h5py.Group, t: int) -> None:
 
         tgt_others = sorted([x for x in tgt_items if x[0] != tgt_top[0] and x[1] > 0.15],
                             key=lambda x: -x[1])
-        lines = [
-            f"EE:     {ee_top[0]}  ({ee_top[1]:.2f})",
-            f"Target: {tgt_top[0]}  ({tgt_top[1]:.2f})  null={tgt_null:.2f}",
+        lines += [
+            f"[baseline filter] EE:     {ee_top[0]}  ({ee_top[1]:.2f})",
+            f"[baseline filter] Target: {tgt_top[0]}  ({tgt_top[1]:.2f})  null={tgt_null:.2f}",
         ]
         if tgt_others:
             lines.append("  also: " + "  ".join(f"{n} {p:.2f}" for n, p in tgt_others))
     else:
-        lines = ["(recompute to see split EE/target belief)"]
+        lines.append("(recompute to see split EE/target belief)")
 
     rr.log("intent/summary", rr.TextDocument("\n".join(lines)))
 
@@ -367,10 +384,10 @@ def log_telemetry(obs: h5py.Group, act: h5py.Group, t: int, arm: str) -> None:
 
 
 def log_signals(obs: h5py.Group, t: int, arm: str, speed: Optional[np.ndarray]) -> None:
-    """Logs phase-judgment aid signals for one arm: EE speed and contact-force
-    magnitude. These aren't raw telemetry (that's the right-hand column) —
-    they're derived signals meant to help a human eyeball phase transitions
-    while labeling or reviewing."""
+    """Logs phase-judgment aid signals for one arm: EE speed, contact-force
+    magnitude, and grasp confirmation. These aren't raw telemetry (that's the
+    right-hand column) — they're derived signals meant to help a human
+    eyeball phase transitions while labeling or reviewing."""
     side = arm.replace("arm_", "")
     if speed is not None and t < len(speed):
         rr.log(f"signals/ee_speed/{side}", rr.Scalars(float(speed[t])))
@@ -379,6 +396,14 @@ def log_signals(obs: h5py.Group, t: int, arm: str, speed: Optional[np.ndarray]) 
     if arm_obs is not None and "F_ext" in arm_obs:
         f_ext = arm_obs["F_ext"][t][:3]
         rr.log(f"signals/contact_force/{side}", rr.Scalars(float(np.linalg.norm(f_ext))))
+
+    # Real grasp-confirmation signal (ArmControl::updateGraspConfirmation),
+    # present on episodes converted after the simulator started logging it or
+    # backfilled offline (see backfill_grasp_confirmed.py) — a clean 0/1 step
+    # is one of the more reliable ways to eyeball exactly when grasp/release
+    # actually happened, alongside the speed/force traces.
+    if arm_obs is not None and "grasp_confirmed" in arm_obs and t < len(arm_obs["grasp_confirmed"]):
+        rr.log(f"signals/grasp_confirmed/{side}", rr.Scalars(float(arm_obs["grasp_confirmed"][t])))
 
 
 def labeling_progress_view() -> rrb.TimeSeriesView:
@@ -426,11 +451,12 @@ def build_blueprint(cfg: dict, has_wrists: bool, extra_label_views: Optional[lis
         ),
         rrb.TimeSeriesView(name="EE speed",       origin="signals/ee_speed"),
         rrb.TimeSeriesView(name="contact force",  origin="signals/contact_force"),
+        rrb.TimeSeriesView(name="grasp confirmed", origin="signals/grasp_confirmed"),
         rrb.TimeSeriesView(name="EE attention",     origin="intent/ee_belief"),
         rrb.TimeSeriesView(name="target attention", origin="intent/target_belief"),
         *extra_label_views,
     ]
-    row_shares = [1, 1.5, 1.5, 2.5, 2.5] + [1.5] * len(extra_label_views)
+    row_shares = [1, 1.5, 1.5, 1, 2.5, 2.5] + [1.5] * len(extra_label_views)
     label_column = rrb.Vertical(*label_rows, row_shares=row_shares)
 
     # ── Telemetry column (compact) ─────────────────────────────────────────
@@ -448,7 +474,7 @@ def build_blueprint(cfg: dict, has_wrists: bool, extra_label_views: Optional[lis
     )
 
 
-def run(episode_path: Path, cfg: dict, model: Optional[IntentModel]) -> None:
+def run(episode_path: Path, cfg: dict, model: Optional[IntentModel], save: Optional[str] = None) -> None:
     """Main playback loop: opens HDF5, resets model, steps through all frames."""
     if not episode_path.exists():
         sys.exit(f"Episode not found: {episode_path}")
@@ -475,16 +501,20 @@ def run(episode_path: Path, cfg: dict, model: Optional[IntentModel]) -> None:
             n_segs = len(seg_data["segments"])
             print(f"Loaded {n_segs} segment(s) from labels/segments")
 
+        # Frames for live model stepping reuse ReplaySource/contracts.features
+        # directly, so a model sees exactly the same input here as at runtime.
+        frame_source = ReplaySource(str(episode_path), load_images=False) if model is not None else None
+
         speed_arrs = {}
         for arm in ("arm_left", "arm_right"):
             arm_obs = obs.get(arm)
             if arm_obs is not None and "O_T_EE" in arm_obs:
                 speed_arrs[arm] = compute_ee_speed(arm_obs["O_T_EE"][:])
 
-        rr.init(f"teleop-intent · episode {episode_id}", spawn=not args.save)
-        if args.save:
-            rr.save(args.save)
-            print(f"Saving recording to {args.save}")
+        rr.init(f"teleop-intent · episode {episode_id}", spawn=not save)
+        if save:
+            rr.save(save)
+            print(f"Saving recording to {save}")
         blueprint = build_blueprint(cfg, has_wrists)
         rr.send_blueprint(blueprint)
 
@@ -505,7 +535,7 @@ def run(episode_path: Path, cfg: dict, model: Optional[IntentModel]) -> None:
                     log_camera(primary_cam, frame, "camera/primary")
 
                     if intent is not None:
-                        log_gaze(intent, t, cfg, frame.shape, primary_cam)
+                        log_gaze(intent, t, cfg, frame.shape, primary_cam, ep)
                         log_slot_boxes(intent, t, frame.shape, ep, names)
 
                 if has_wrists and cfg["camera"].get("show_wrists", True):
@@ -519,18 +549,16 @@ def run(episode_path: Path, cfg: dict, model: Optional[IntentModel]) -> None:
                     log_signals(obs, t, arm, speed_arrs.get(arm))
 
                 if intent is not None:
+                    # Baseline filter is always shown, model or not -- it's a
+                    # useful reference point even when comparing a live model.
+                    log_belief_from_hdf5(intent, t, names)
+                    model_out = None
                     if model is not None:
-                        cf = build_candidate_features(intent, t)
-                        if cf is not None:
-                            pred: IntentPrediction = model.step(cf)
-                            n = int(intent["n_slots"][t]) if "n_slots" in intent else len(pred.object_posterior)
-                            mask = np.zeros(len(pred.object_posterior), dtype=bool)
-                            mask[:n] = True
-                            log_intent_posterior(pred.object_posterior, mask, names, pred.object_entropy(), t)
-                    else:
-                        log_belief_from_hdf5(intent, t, names)
-                    if intent is not None:
-                        log_intent_summary(intent, t)
+                        sframe = frame_source.frame_at(t)
+                        model_out = model.step(sframe)
+                        log_intent_output(model_out, names[2:], sframe.candidate_mask, t)
+                        log_model_slot_boxes(intent, t, frame.shape, ep, names[2:], model_out, sframe.candidate_mask)
+                    log_intent_summary(intent, t, model_out=model_out, pickplace_names=names[2:])
 
                 if seg_data is not None:
                     log_label_signals(seg_data, t)
@@ -543,6 +571,9 @@ def run(episode_path: Path, cfg: dict, model: Optional[IntentModel]) -> None:
 
         except KeyboardInterrupt:
             print("\nPlayback stopped.")
+        finally:
+            if frame_source is not None:
+                frame_source.close()
 
 
 def main() -> None:
@@ -574,7 +605,7 @@ def main() -> None:
 
     model = load_model(cfg)
     episode_path = resolve_episode_path(cfg, args.episode)
-    run(episode_path, cfg, model)
+    run(episode_path, cfg, model, save=args.save)
 
 
 if __name__ == "__main__":

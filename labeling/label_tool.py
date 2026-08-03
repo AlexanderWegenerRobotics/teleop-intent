@@ -1,32 +1,10 @@
 """
 labeling/label_tool.py — standalone manual labeling tool (replaces segment.py).
 
-segment.py inferred phase (IDLE/APPROACH/GRASP/TRANSPORT/PLACE) and target
-object per arm from gripper-width + object-lift heuristics. That's gone now:
-this tool lets a human watch the episode and mark it by eye instead.
-
-This is deliberately NOT built on Rerun. An earlier version tried to pair a
-Tkinter control panel with a spawned Rerun viewer, but Rerun has no supported
-way for an external process to read back the viewer's current playhead or
-reliably force it to an arbitrary point — the two windows could drift apart
-with no way to reconcile them. For a tight scrub-and-mark labeling loop,
-that's a fragile foundation.
-
-Instead this is one self-contained window: a single process draws the video
-frame (with gaze dot + slot boxes burned in via PIL) and small context plots
-(EE speed, contact force, gripper width/cmd, EE attention, plus your own
-labeled-phase/labeled-target progress) with a moving cursor line, all from
-the same scrub position. There is nothing to keep in sync because there is
-only one source of truth. viz/playback.py (Rerun) remains the tool for rich
-multi-view review; this tool is only for producing labels.
-
 Labels are written back to the episode HDF5 in the same schema segment.py
 used to write (labels/arm_{side}_phase, labels/arm_{side}_target_name), so
 nothing downstream (recompute_intent_belief.py, viz/playback.py) needs to
 change.
-
-Dependencies: h5py, numpy, pyyaml, Pillow, matplotlib (all pip-installable;
-no rerun-sdk needed).
 
 Usage:
     python labeling/label_tool.py
@@ -161,7 +139,7 @@ def render_frame(raw_frame: np.ndarray, intent, t: int, cfg: dict, ep: h5py.File
     draw = ImageDraw.Draw(img)
 
     if intent is not None:
-        gp = compute_gaze_px(intent, t, cfg, raw_frame.shape)
+        gp = compute_gaze_px(intent, t, cfg, raw_frame.shape, ep=ep)
         if gp is not None:
             gx, gy = gp
             r = cfg["gaze"].get("dot_radius_px", 4)
@@ -328,6 +306,23 @@ class EpisodeSession:
         self.phase[side] = phase_copy
         self.target[side] = target_copy
         return side
+
+    # A model-draft pre-fill (RandomForest, labeling/prefill.py) used to live
+    # here and was removed deliberately, not because it failed to run.
+    #
+    # It drafted labels at ~83-89% frame accuracy, which sounds usable and is
+    # not: the errors concentrated at phase transitions, which is precisely
+    # where a human labeller has to make the judgement call, and precisely
+    # what every downstream duration and onset metric is computed from. An
+    # accept-and-correct workflow anchors on what it is shown, so a draft that
+    # is wrong at the boundaries does not merely waste review time -- it pulls
+    # the hand labels toward its own errors and contaminates the only ground
+    # truth this project has. A pre-fill has to be trustworthy exactly where
+    # it is hardest to be, or it is worse than a blank slate.
+    #
+    # If it is ever revisited: train it against macro F1 rather than accuracy
+    # (idle is over half the frames, so accuracy rewards predicting idle), and
+    # judge it on boundary placement, not on frame counts.
 
     def clear_labels(self, side: str) -> None:
         """Zeros out every existing label for one arm across the whole

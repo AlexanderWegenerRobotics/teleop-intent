@@ -4,7 +4,22 @@ __pycache__/
 *$py.class
 
 .vscode/
-data/
+checkpoints/
+labeling/models/
+scripts/migrations/
+
+# Bulk episode data is external, but the manifest and the SPLITS define every
+# experiment in this repo -- without them in version control no reported
+# number is reproducible, because nobody can reconstruct which episodes were
+# held out.
+data/*
+!data/manifest.csv
+!data/splits/
+
+# Generated reports and figures, NOT the harness that produces them. `eval/`
+# on its own was ignoring score.py, boundary_analysis.py and plot_training.py
+# -- source code that had never been committed.
+eval/reports/
 
 # C extensions
 *.so

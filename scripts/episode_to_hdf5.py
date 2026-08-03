@@ -34,7 +34,11 @@ import sys
 
 import numpy as np
 
-SCHEMA_VERSION = 2
+# v3: gaze_px_*/slot_px_* are normalized pinhole ray coords ((u-cx)/fx) written
+# directly by the fixed intention_buffer.cpp, not raw pixels needing rescaling
+# here. Raw logs collected before that fix are still in native pixel units and
+# must be converted with --legacy-pixel-intent (see _norm_intent_col below).
+SCHEMA_VERSION = 3
 
 try:
     import h5py
@@ -176,6 +180,47 @@ def nearest_idx(stream_ts, grid_ts):
     return np.where(np.abs(grid_ts - left) <= np.abs(right - grid_ts), pos - 1, pos)
 
 
+def candidate_scene_prefix(name):
+    """Maps a candidate name like 'object_3' or 'bin_1' to its scene.csv
+    column prefix ('obj2', 'bin0') -- 1-based candidate naming, 0-based
+    scene.csv column indexing. Returns None for EE names or anything that
+    doesn't parse (never guess)."""
+    if name.startswith("object_"):
+        try:
+            return f"obj{int(name.split('_')[1]) - 1}"
+        except (ValueError, IndexError):
+            return None
+    if name.startswith("bin_"):
+        try:
+            return f"bin{int(name.split('_')[1]) - 1}"
+        except (ValueError, IndexError):
+            return None
+    return None
+
+
+def candidate_world_positions(scene_hdr, scene_data, scene_wall, grid, slot_names):
+    """Returns {joint_slot_index: [len(grid),3] world (x,y,z)} for every
+    pick/place slot whose name maps to a scene.csv obj/bin column -- the
+    true simulated position, sourced from scene.csv (not reconstructed from
+    any pixel/distance data), downsampled onto the same master grid as
+    everything else. slot_names: {joint_slot_index: name string}, one name
+    per candidate (assumed constant for the whole episode, same assumption
+    contracts.features.candidate_names already makes).
+    """
+    sel = nearest_idx(scene_wall, grid)
+    out = {}
+    for i, name in slot_names.items():
+        prefix = candidate_scene_prefix(name)
+        if prefix is None:
+            continue
+        cols = [f"{prefix}_{c}" for c in ("x", "y", "z")]
+        if not all(c in scene_hdr for c in cols):
+            continue
+        idx = [scene_hdr.index(c) for c in cols]
+        out[i] = scene_data[:, idx][sel]
+    return out
+
+
 # ── Episode ────────────────────────────────────────────────────────────────
 
 def read_meta(folder):
@@ -306,7 +351,7 @@ def _write_eye_dataset(imgs_group, eye_name, eye_frames, stereo_attrs, cam_param
             ds.attrs["T_world_cam"] = np.asarray(cp["T_world_cam"], dtype=np.float64)
 
 
-def convert(folder, out_path, rate, scale, cameras, camera_params_path=None):
+def convert(folder, out_path, rate, scale, cameras, camera_params_path=None, legacy_pixel_intent=False):
     cams = {}
     cam_native_dims = {}
     for name in cameras:
@@ -420,6 +465,13 @@ def convert(folder, out_path, rate, scale, cameras, camera_params_path=None):
             st = col_one(hdr, data, "state")
             if st is not None:
                 g.create_dataset("state", data=st[sel].astype(np.int64))
+            # Live-computed grasp confirmation (ArmControl::updateGraspConfirmation),
+            # logged natively from arm_control.cpp on episodes recorded after that
+            # change -- absent on older logs, backfilled offline instead (see
+            # scripts/backfill_grasp_confirmed.py).
+            gcf = col_one(hdr, data, "grasp_confirmed")
+            if gcf is not None:
+                g.create_dataset("grasp_confirmed", data=gcf[sel].astype(bool))
 
             ag = act.create_group(arm)
             for field, n in (("q_cmd_", 7), ("O_T_EE_cmd_", 16)):
@@ -458,7 +510,13 @@ def convert(folder, out_path, rate, scale, cameras, camera_params_path=None):
             eye_w = full_stereo_w / 2.0 if full_stereo_w is not None else None
 
             def _norm_intent_col(col, arr):
-                if full_stereo_w is None:
+                # Default (schema v3+): gaze_px_*/slot_px_* already arrive as
+                # normalized pinhole ray coords from intention_buffer.cpp -- pass
+                # through untouched. --legacy-pixel-intent reproduces the old
+                # (schema v2) division for raw logs collected before that fix,
+                # where these columns were still native pixels in two different
+                # camera spaces (full-stereo for gaze, single-eye for slots).
+                if not legacy_pixel_intent or full_stereo_w is None:
                     return arr
                 if col == "gaze_px_x":
                     return arr / full_stereo_w
@@ -480,9 +538,30 @@ def convert(folder, out_path, rate, scale, cameras, camera_params_path=None):
                     ig.create_dataset(col, data=_norm_intent_col(col, arr).astype(np.float32))
                 else:
                     ig.create_dataset(col, data=arr)
-            ig.attrs["px_normalized"]      = True
+            ig.attrs["gaze_units"]         = "pixel_fraction" if legacy_pixel_intent else "normalized_ray"
+            ig.attrs["px_normalized"]      = True  # kept for older readers; see gaze_units for the real convention
             ig.attrs["gaze_px_ref_width"]  = int(full_stereo_w) if full_stereo_w else 0
             ig.attrs["gaze_px_ref_height"] = int(full_stereo_h) if full_stereo_h else 0
+
+            # Candidate world positions (slot_pos_x/y/z_i), sourced from
+            # scene.csv's true simulated object/bin poses -- sim-privileged
+            # ground truth, not derived from pixels/distance, used to compute
+            # EE-to-candidate direction downstream (models/hmm's alignment
+            # feature). Only meaningful in sim; a real perception stack would
+            # need its own proxy here eventually.
+            if scene is not None:
+                scene_hdr, scene_data, scene_wall = scene
+                slot_names = {}
+                for col, arr in intent.items():
+                    if col.startswith("slot_name_"):
+                        i = int(col[len("slot_name_"):])
+                        v = arr[0]
+                        slot_names[i] = v.decode() if isinstance(v, (bytes, np.bytes_)) else str(v)
+                positions = candidate_world_positions(scene_hdr, scene_data, scene_wall, grid, slot_names)
+                for i, pos in positions.items():
+                    ig.create_dataset(f"slot_pos_x_{i}", data=pos[:, 0].astype(np.float32))
+                    ig.create_dataset(f"slot_pos_y_{i}", data=pos[:, 1].astype(np.float32))
+                    ig.create_dataset(f"slot_pos_z_{i}", data=pos[:, 2].astype(np.float32))
 
         if scene is not None:
             hdr, data, ts = scene
@@ -536,10 +615,10 @@ def convert(folder, out_path, rate, scale, cameras, camera_params_path=None):
 
 
 def _convert_one(args_tuple):
-    folder, out_path, rate, scale, cameras, camera_params_path = args_tuple
+    folder, out_path, rate, scale, cameras, camera_params_path, legacy_pixel_intent = args_tuple
     try:
         convert(folder, out_path, rate, scale, cameras,
-                camera_params_path=camera_params_path)
+                camera_params_path=camera_params_path, legacy_pixel_intent=legacy_pixel_intent)
     except Exception as e:
         print(f"  [error] {folder}: {e}")
 
@@ -560,6 +639,11 @@ def main():
                     help="parallel worker processes (default 1); set to -1 to use all CPU cores")
     ap.add_argument("--overwrite", action="store_true",
                     help="re-convert even if episode.hdf5 already exists")
+    ap.add_argument("--legacy-pixel-intent", action="store_true",
+                    help="raw logs collected before the intention_buffer.cpp ray-normalization "
+                         "fix still have gaze_px_*/slot_px_* in native pixels (two different "
+                         "camera spaces); pass this to reproduce the old rescale-to-[0,1] step. "
+                         "Omit for anything collected after that fix (the new default: pass through).")
     args = ap.parse_args()
 
     if args.all:
@@ -575,7 +659,8 @@ def main():
                 print(f"  [skip] {folder}: {args.out} already exists")
                 continue
             print(f"  [overwrite] {folder}: re-converting")
-        work.append((folder, out_path, args.rate, args.scale, args.cameras, args.camera_params))
+        work.append((folder, out_path, args.rate, args.scale, args.cameras, args.camera_params,
+                     args.legacy_pixel_intent))
 
     if not work:
         print("Nothing to convert.")

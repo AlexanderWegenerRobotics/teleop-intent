@@ -111,7 +111,12 @@ def main():
     if not os.path.exists(manifest_path):
         sys.exit(f"Manifest not found: {manifest_path}. Run build_manifest.py first.")
 
-    df = pd.read_csv(manifest_path)
+    # dtype=str on episode_id is load-bearing: episode ids are zero-padded
+    # ("000", "001", ...) and pandas would otherwise auto-infer this column as
+    # int64 (every value looks numeric), silently dropping the padding -- the
+    # split files would then read back as "0"/"1"/... and never match a real
+    # episode folder or manifest row for anything below id 100.
+    df = pd.read_csv(manifest_path, dtype={"episode_id": str})
     ratios = split_cfg.get("ratios", {"train": 0.7, "val": 0.15, "test": 0.15})
     if abs(sum(ratios.values()) - 1.0) > 1e-6:
         sys.exit(f"Split ratios must sum to 1.0, got {sum(ratios.values())}")

@@ -100,15 +100,33 @@ def compute_ee_speed(o_t_ee: np.ndarray, smooth_win: int = 9) -> np.ndarray:
 # Gaze / slot-box pixel projection (shared math — do not duplicate!)
 # ---------------------------------------------------------------------------
 
-def compute_gaze_px(intent, t: int, cfg: dict, img_shape: tuple) -> Optional[tuple[float, float]]:
+def _camera_intrinsics(ep) -> Optional[dict]:
+    """Returns {fx, fy, cx, cy} for the camera intention_buffer.cpp actually
+    projected gaze/slots against — always the head camera, independent of
+    whichever camera a playback tool happens to display — or None if the
+    episode has no stored intrinsics (older conversions without
+    camera_params.json available)."""
+    images = ep["observations"].get("images") if "observations" in ep else None
+    if images is None:
+        return None
+    for cam in ("head_cam_left", "head_cam_right"):
+        if cam in images and all(k in images[cam].attrs for k in ("fx", "fy", "cx", "cy")):
+            a = images[cam].attrs
+            return {"fx": float(a["fx"]), "fy": float(a["fy"]),
+                    "cx": float(a["cx"]), "cy": float(a["cy"])}
+    return None
+
+
+def compute_gaze_px(intent, t: int, cfg: dict, img_shape: tuple, ep=None) -> Optional[tuple[float, float]]:
     """Returns the (x, y) pixel position of the gaze point on the primary
     camera image at frame t, in stored-image pixel space, or None if gaze is
     disabled/invalid/out of range for this frame.
 
-    Gaze UV is in full-stereo space [0, 1] where 0.5 = boundary between eyes.
-    Both left and right camera images span the same scene (stereo pair with
-    small baseline), so gaze UV maps approximately directly to each camera's
-    pixel space.
+    Schema v3+ (intent.attrs["gaze_units"] == "normalized_ray"): gaze_px_x/y
+    are pinhole ray coords (u-cx)/fx written directly by intention_buffer.cpp
+    — un-projected here via the episode's stored camera intrinsics, which
+    requires `ep`. Older episodes (or ones built with
+    --legacy-pixel-intent) fall back to the original full-stereo-fraction math.
     """
     if not cfg["gaze"].get("show", True):
         return None
@@ -118,11 +136,25 @@ def compute_gaze_px(intent, t: int, cfg: dict, img_shape: tuple) -> Optional[tup
         return None
 
     stored_h, stored_w = img_shape[:2]
-    px_normalized = bool(intent.attrs.get("px_normalized", False))
-
     raw_x = float(intent["gaze_px_x"][t])
     raw_y = float(intent["gaze_px_y"][t])
 
+    if intent.attrs.get("gaze_units") == "normalized_ray":
+        if ep is None:
+            return None
+        intr = _camera_intrinsics(ep)
+        if intr is None:
+            return None
+        image_scale = float(ep.attrs.get("image_scale", 0.25))
+        gx = (intr["fx"] * raw_x + intr["cx"]) * image_scale
+        gy = (intr["fy"] * raw_y + intr["cy"]) * image_scale
+        if not (0 <= gx <= stored_w and 0 <= gy <= stored_h):
+            return None
+        return gx, gy
+
+    # Legacy (schema <=2, or --legacy-pixel-intent): normalized fraction of
+    # the full-stereo frame.
+    px_normalized = bool(intent.attrs.get("px_normalized", False))
     if px_normalized:
         gaze_uv_x, gaze_uv_y = raw_x, raw_y
     else:
@@ -138,18 +170,61 @@ def compute_gaze_px(intent, t: int, cfg: dict, img_shape: tuple) -> Optional[tup
     return gaze_uv_x * stored_w, gaze_uv_y * stored_h
 
 
+def project_slot_positions(intent, t: int, ep, img_shape: tuple) -> list[Optional[tuple[float, float]]]:
+    """Returns stored-image pixel (u, v) for each slot_px_u_i/slot_px_v_i at
+    frame t, or None per-slot if invalid/behind camera/out of frame.
+
+    Handles both the normalized-ray convention (schema v3+) and the legacy
+    pixel-fraction convention transparently. This is the one place slot
+    pixel projection happens; compute_slot_boxes (hdf5 belief coloring) and
+    any live-model overlay (playback.py) both build on it, so they can never
+    silently disagree on where a box goes.
+    """
+    n_slots_val = int(intent["n_slots"][t]) if "n_slots" in intent else 0
+    stored_h, stored_w = img_shape[:2]
+    image_scale = float(ep.attrs.get("image_scale", 0.25))
+    gaze_units = intent.attrs.get("gaze_units")
+    intr = _camera_intrinsics(ep) if gaze_units == "normalized_ray" else None
+
+    out: list[Optional[tuple[float, float]]] = []
+    for i in range(n_slots_val):
+        u_key, v_key = f"slot_px_u_{i}", f"slot_px_v_{i}"
+        if u_key not in intent or v_key not in intent:
+            out.append(None)
+            continue
+        u_raw, v_raw = float(intent[u_key][t]), float(intent[v_key][t])
+
+        if gaze_units == "normalized_ray":
+            if intr is None or u_raw < -100 or v_raw < -100:  # kNotProjected sentinel is -1000
+                out.append(None)
+                continue
+            u_native = intr["fx"] * u_raw + intr["cx"]
+            v_native = intr["fy"] * v_raw + intr["cy"]
+        else:
+            if u_raw < 0 or v_raw < 0:  # legacy sentinel
+                out.append(None)
+                continue
+            u_native, v_native = u_raw, v_raw
+
+        u_stored, v_stored = u_native * image_scale, v_native * image_scale
+        if not (0 <= u_stored <= stored_w and 0 <= v_stored <= stored_h):
+            out.append(None)
+            continue
+        out.append((u_stored, v_stored))
+    return out
+
+
 def compute_slot_boxes(intent, t: int, img_shape: tuple, ep, names: list[str]) -> tuple[list[dict], list[dict]]:
     """Returns (ee_boxes, tgt_boxes): lists of {"u", "v", "belief", "label"}
     dicts for the projected end-effector and object/bin slots at frame t, in
-    stored-image pixel space. Belief is 0..1 (0 if no belief data present) —
-    callers map it to a color however suits their renderer.
+    stored-image pixel space, colored by the hdf5's own logged belief (the
+    live/baseline filter, NOT a model — see playback.py for model-colored
+    boxes). Belief is 0..1 (0 if no belief data present) — callers map it to
+    a color however suits their renderer.
     """
-    n_slots_val = int(intent["n_slots"][t]) if "n_slots" in intent else 0
-    if n_slots_val == 0:
+    positions = project_slot_positions(intent, t, ep, img_shape)
+    if not positions:
         return [], []
-
-    image_scale = float(ep.attrs.get("image_scale", 0.25))
-    stored_h, stored_w = img_shape[:2]
 
     has_split = any(k.startswith("ee_belief_") for k in intent.keys())
     if has_split:
@@ -168,16 +243,10 @@ def compute_slot_boxes(intent, t: int, img_shape: tuple, ep, names: list[str]) -
     EE_SLOT_NAMES = {"ee_left", "ee_right"}
     ee_boxes, tgt_boxes = [], []
 
-    for i in range(n_slots_val):
-        u_key, v_key = f"slot_px_u_{i}", f"slot_px_v_{i}"
-        if u_key not in intent or v_key not in intent:
-            break
-        u_native, v_native = float(intent[u_key][t]), float(intent[v_key][t])
-        if u_native < 0 or v_native < 0:
+    for i, pos in enumerate(positions):
+        if pos is None:
             continue
-        u_stored, v_stored = u_native * image_scale, v_native * image_scale
-        if not (0 <= u_stored <= stored_w and 0 <= v_stored <= stored_h):
-            continue
+        u_stored, v_stored = pos
         name = names[i] if i < len(names) else f"slot_{i}"
         entry = {"u": u_stored, "v": v_stored, "belief": belief_by_name.get(name, 0.0), "label": name}
         (ee_boxes if name in EE_SLOT_NAMES else tgt_boxes).append(entry)
