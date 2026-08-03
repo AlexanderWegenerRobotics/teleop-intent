@@ -152,8 +152,17 @@ class EpisodeFeatureBuilder:
         self._phase_state = None
         self._world_ee_state = None
 
-    def step(self, frame: SensorFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Returns (arm_features [D_arm], candidate_features [n, D_cand], mask [n])."""
+    def step(self, frame: SensorFrame,
+             phase: int | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Returns (arm_features [D_arm], candidate_features [n, D_cand], mask [n]).
+
+        `phase` gates held.target_exclusion_mask. Pass the PREVIOUS frame's
+        phase -- the label while building training tensors, the model's own
+        previous prediction at inference. Using the previous frame keeps the
+        two paths structurally identical: the alternative (current-frame label
+        at training, previous-frame estimate at serving) would differ in two
+        ways at once and make any resulting mismatch impossible to attribute.
+        """
         arm, self._phase_state = phase_features(frame, self.side, self._phase_state)
         ee_vel, ee_pos, self._world_ee_state = world_ee_velocity(
             frame, self.side, self._world_ee_state)
@@ -162,7 +171,7 @@ class EpisodeFeatureBuilder:
         # another object either, so object-type candidates drop out while
         # holding. Applied here rather than in the network so both models are
         # choosing from an identical candidate set.
-        mask = frame.candidate_mask & ~target_exclusion_mask(frame, self.side)
+        mask = frame.candidate_mask & ~target_exclusion_mask(frame, self.side, phase)
         return np.nan_to_num(arm, nan=0.0, posinf=0.0, neginf=0.0), cand, mask
 
 

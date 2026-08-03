@@ -68,6 +68,7 @@ class HMMIntentModel(TrainableIntentModel):
 
         arms = {}
         null_probs = {}
+        pool_masks = {}
         for side in SIDES:
             feats, self._prev_phase_state[side] = phase_features(obs, side, self._prev_phase_state[side])
             phase_posterior = self._phase[side].step(feats)
@@ -79,7 +80,7 @@ class HMMIntentModel(TrainableIntentModel):
             # (phase's min_candidate_dist above is unaffected: proximity to
             # *something* is still phase-informative even while holding it,
             # the category error only applies to "which candidate is the goal").
-            target_mask = obs.candidate_mask & ~target_exclusion_mask(obs, side)
+            target_mask = obs.candidate_mask & ~target_exclusion_mask(obs, side, phase_estimate)
 
             # ee_vel/ee_pos here are DELIBERATELY NOT phase's own ee_vel
             # (feats[:3]): phase uses O_T_EE (every-frame, base frame), while
@@ -107,8 +108,16 @@ class HMMIntentModel(TrainableIntentModel):
 
             arms[side] = ArmIntent(phase_posterior=phase_posterior, target_posterior=target_posterior)
             null_probs[side] = null_prob
+            pool_masks[side] = target_mask
 
-        return IntentOutput(left=arms["left"], right=arms["right"], extras={"target_null_prob": null_probs})
+        # target_pool_mask reports which candidates were actually selectable
+        # this frame, AFTER held.target_exclusion_mask. The eval harness needs
+        # it to tell a genuine mistake from a label naming a candidate the
+        # model was never allowed to choose -- and it cannot derive that
+        # itself without hard-coding one model's exclusion rule.
+        return IntentOutput(left=arms["left"], right=arms["right"],
+                            extras={"target_null_prob": null_probs,
+                                    "target_pool_mask": pool_masks})
 
     def fit(self, train_data: list[dict], val_data: list[dict], config: dict) -> dict:
         """train_data/val_data: lists of per-episode dicts, one per (episode,

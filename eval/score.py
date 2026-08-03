@@ -87,10 +87,19 @@ def score_episode(model, hdf5_path: str) -> dict | None:
             r["true_target"].append(int(target_label[t]))
             r["pred_target"].append(ai.top_target())
             r["target_entropy"].append(ai.target_entropy())
+            # Reachability must be judged against the pool the MODEL chose
+            # from, not against raw visibility. Using frame.candidate_mask
+            # here caught only "the candidate was not logged this frame"
+            # (~2% of committed frames) and missed the dominant cause,
+            # held-object exclusion (~9%), so the reported reachable-only
+            # accuracy was barely different from the raw one and gave a false
+            # impression that the label disagreement had been accounted for.
+            pool = (out.extras or {}).get("target_pool_mask", {}).get(side)
+            if pool is None:
+                pool = frame.candidate_mask
             lbl = int(target_label[t])
             r["target_reachable"].append(
-                bool(lbl == NULL_TARGET or (0 <= lbl < frame.candidate_mask.shape[0]
-                                            and frame.candidate_mask[lbl])))
+                bool(lbl == NULL_TARGET or (0 <= lbl < len(pool) and bool(pool[lbl]))))
     src.close()
     return records
 

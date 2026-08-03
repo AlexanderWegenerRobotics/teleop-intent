@@ -37,7 +37,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from teleop_orchestrator.contracts import SensorFrame, GLOBAL_FEATURE_NAMES, CANDIDATE_FEATURE_NAMES
+from teleop_orchestrator.contracts import (SensorFrame, GLOBAL_FEATURE_NAMES,
+                                            CANDIDATE_FEATURE_NAMES, Phase)
 from teleop_orchestrator.contracts.features import CAND_OBJECT
 
 _DIST_COL = {"left": CANDIDATE_FEATURE_NAMES.index("dist_left"),
@@ -86,13 +87,50 @@ def held_object_mask(frame: SensorFrame, side: str) -> np.ndarray:
     return held
 
 
-def target_exclusion_mask(frame: SensorFrame, side: str) -> np.ndarray:
-    """Candidates to exclude from the target pool while this arm is holding
+# Phases in which a held object is genuinely no longer the operator's target.
+#
+# GRASP is deliberately NOT here, and that omission is the fix for a measured
+# bug. grasp_confirmed goes true the moment the gripper reports a successful
+# close, which happens while the fingers are still settling and well before
+# the object is being carried anywhere. Excluding objects from that instant
+# meant that during GRASP -- the phase whose entire purpose is acting on that
+# object -- the model was forbidden from naming it.
+#
+# The damage was measured, not guessed: 9952 of 92389 committed training
+# frames (10.8%) had a labelled target the pool excluded, and 6434 of those
+# were GRASP frames. Every model in this repo scored a guaranteed error on
+# them, and the HMM had been doing so silently since v1 because _score clamped
+# the impossible probability at 1e-12 instead of complaining.
+#
+# APPROACH is excluded for the same reason (831 frames): if the gripper
+# confirms early on a mis-grasp, the operator is still reaching for that
+# object and it is still the answer.
+EXCLUSION_PHASES = frozenset({Phase.TRANSPORT, Phase.PLACE})
+
+
+def target_exclusion_mask(frame: SensorFrame, side: str,
+                          phase: int | None = None) -> np.ndarray:
+    """Candidates to exclude from the target pool while this arm is carrying
     something: every CAND_OBJECT-type candidate, not just the specific one
     held -- a full gripper can't be reaching for a different object either.
     Bins are never excluded here (they're never "held").
+
+    `phase` gates the rule to EXCLUSION_PHASES. Pass the current phase (the
+    model's own estimate at inference, the label while fitting) and objects
+    stay selectable during APPROACH and GRASP, where the labels say they are
+    the target. Pass None for the pre-fix behaviour -- kept only so an old
+    checkpoint can be re-scored under the rule it was fitted with, never as a
+    default for new work.
+
+    Note the remaining disagreement this does NOT resolve: 2433 TRANSPORT and
+    254 PLACE frames still carry an object-valued target label. Those are a
+    real question about what "target" means mid-carry -- the object you are
+    moving, or the bin you are moving it to -- and the answer belongs in the
+    labelling guide, not in this function.
     """
     n = len(frame.candidate_mask)
+    if phase is not None and int(phase) not in EXCLUSION_PHASES:
+        return np.zeros(n, dtype=bool)
     if not is_holding(frame, side):
         return np.zeros(n, dtype=bool)
     return (frame.candidate_types == CAND_OBJECT) & frame.candidate_mask

@@ -69,7 +69,13 @@ def build_episode_arrays(hdf5_path: str) -> dict | None:
         # HMMIntentModel.step) -- must match here too, or the fitted
         # rho/sigma parameters are learned against a candidate pool that
         # doesn't match what runtime actually sees.
-        target_masks = np.stack([fr.candidate_mask & ~target_exclusion_mask(fr, side) for fr in frames])
+        # Phase-gated exclusion (held.EXCLUSION_PHASES), conditioned on the
+        # LABEL here and on the model's own estimate at inference -- the same
+        # teacher-forcing already used for rho_tight/rho_loose, and acceptable
+        # for the same reason: the gate only asks "are we carrying yet", a much
+        # coarser question than the five-way phase call.
+        target_masks = np.stack([fr.candidate_mask & ~target_exclusion_mask(fr, side, ph)
+                                 for fr, ph in zip(frames, phase_labels)])
 
         out[side] = {
             "phase_features": np.stack(feats_list),

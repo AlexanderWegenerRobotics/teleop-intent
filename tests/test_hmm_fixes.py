@@ -698,3 +698,57 @@ if __name__ == "__main__":
             print(f"FAIL  {name}\n      {e}")
     print(f"\n{len(fns) - failed}/{len(fns)} passed")
     sys.exit(1 if failed else 0)
+
+
+# --------------------------------------------------------------------------
+# Phase-gated held-object exclusion (the 10.8% unreachable-label bug).
+# --------------------------------------------------------------------------
+
+class _HeldFrame:
+    """Minimal frame for held.py: one object candidate, one bin, holding."""
+
+    def __init__(self, holding=True):
+        from tests._stub_contracts import CANDIDATE_FEATURE_NAMES, GLOBAL_FEATURE_NAMES, CAND_OBJECT, CAND_BIN
+        self.candidate_mask = np.ones(2, dtype=bool)
+        self.candidate_types = np.array([CAND_OBJECT, CAND_BIN])
+        self.candidate_features = np.zeros((2, len(CANDIDATE_FEATURE_NAMES)))
+        self.global_features = np.zeros(len(GLOBAL_FEATURE_NAMES))
+        self.grasp_confirmed = {"left": holding, "right": holding}
+
+
+def test_exclusion_does_not_fire_during_grasp_or_approach():
+    """THE 10.8% BUG. grasp_confirmed goes true while the fingers are still
+    settling, so the old unconditional rule removed the object from the pool
+    during GRASP -- the phase whose whole purpose is acting on that object.
+    6434 of 9952 unreachable training labels were GRASP frames."""
+    from models.hmm.held import target_exclusion_mask
+    f = _HeldFrame(holding=True)
+    for phase in (Phase.IDLE, Phase.APPROACH, Phase.GRASP):
+        assert not target_exclusion_mask(f, "left", phase).any(), (
+            f"objects excluded during {Phase.NAMES[phase]} while holding")
+
+
+def test_exclusion_still_fires_while_carrying():
+    """The rule must survive where it was right: once transporting or placing,
+    a full gripper genuinely is not reaching for an object."""
+    from models.hmm.held import target_exclusion_mask
+    f = _HeldFrame(holding=True)
+    for phase in (Phase.TRANSPORT, Phase.PLACE):
+        m = target_exclusion_mask(f, "left", phase)
+        assert m[0] and not m[1], f"expected object excluded, bin kept, in {Phase.NAMES[phase]}"
+
+
+def test_exclusion_never_fires_when_not_holding():
+    from models.hmm.held import target_exclusion_mask
+    f = _HeldFrame(holding=False)
+    for phase in range(Phase.N_CLASSES):
+        assert not target_exclusion_mask(f, "left", phase).any()
+
+
+def test_phase_none_reproduces_the_old_unconditional_rule():
+    """Kept so an old checkpoint can be re-scored under the rule it was fitted
+    with. Must be the pre-fix behaviour exactly, not an approximation."""
+    from models.hmm.held import target_exclusion_mask
+    m = target_exclusion_mask(_HeldFrame(holding=True), "left", None)
+    assert m[0] and not m[1]
+    assert not target_exclusion_mask(_HeldFrame(holding=False), "left", None).any()

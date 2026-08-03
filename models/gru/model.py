@@ -199,6 +199,12 @@ class GRUIntentModel(TrainableIntentModel):
         self.cand_std: np.ndarray | None = None
         self._builders = {s: EpisodeFeatureBuilder(s, rich=self.config["rich"]) for s in SIDES}
         self._h = {s: None for s in SIDES}
+        # Previous frame's predicted phase, used to gate the held-object
+        # exclusion. None on the first frame of an episode, which means no
+        # exclusion -- the safe direction, since a spurious exclusion removes
+        # the correct answer outright while a missing one only leaves an extra
+        # candidate in play.
+        self._prev_phase = {s: None for s in SIDES}
         # CPU only, deliberately. The network is ~28k parameters stepped one
         # arm-sequence at a time, so runtime is dominated by Python-level loop
         # and kernel-launch overhead rather than by arithmetic -- a GPU is
@@ -215,6 +221,7 @@ class GRUIntentModel(TrainableIntentModel):
         for s in SIDES:
             self._builders[s].reset()
             self._h[s] = None
+            self._prev_phase[s] = None
 
     def _normalise(self, arm: np.ndarray, cand: np.ndarray):
         """Standardise inputs with statistics frozen from the training split.
@@ -231,9 +238,9 @@ class GRUIntentModel(TrainableIntentModel):
 
     def step(self, obs: SensorFrame) -> IntentOutput:
         _require_torch()
-        arms, null_probs = {}, {}
+        arms, null_probs, pool_masks = {}, {}, {}
         for side in SIDES:
-            arm, cand, mask = self._builders[side].step(obs)
+            arm, cand, mask = self._builders[side].step(obs, self._prev_phase[side])
             arm_n, cand_n = self._normalise(arm[None, None, :], cand[None, None, :, :])
             with torch.no_grad():
                 p_logits, t_logits, h = self.net(
@@ -253,11 +260,16 @@ class GRUIntentModel(TrainableIntentModel):
                 n_valid = max(int(mask.sum()), 1)
                 target_posterior = np.where(mask, 1.0 / n_valid, 0.0)
 
+            self._prev_phase[side] = int(np.argmax(phase_posterior))
             arms[side] = ArmIntent(phase_posterior=phase_posterior,
                                    target_posterior=target_posterior)
             null_probs[side] = null_prob
+            pool_masks[side] = mask
+        # See the note in models/hmm/model.py: the harness cannot compute the
+        # selectable pool itself without embedding one model's exclusion rule.
         return IntentOutput(left=arms["left"], right=arms["right"],
-                            extras={"target_null_prob": null_probs})
+                            extras={"target_null_prob": null_probs,
+                                    "target_pool_mask": pool_masks})
 
     # -- persistence ------------------------------------------------------
     def build(self, d_arm: int, d_cand: int) -> None:

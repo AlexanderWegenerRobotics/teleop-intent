@@ -21,6 +21,13 @@ data/*
 # -- source code that had never been committed.
 eval/reports/
 
+# docs/ IS tracked: it holds the handful of figures, tables and the video the
+# README cites, which have to travel with the repo or the README renders as
+# broken images. Only the scratch frame dump from viz/compare_video.py is not.
+docs/_video_frames/
+docs/_palette.png
+docs/_small.mp4
+
 # C extensions
 *.so
 
