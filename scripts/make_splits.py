@@ -91,6 +91,19 @@ def stratified_split(df, ratios, stratify_keys, seed):
     return sorted(train), sorted(val), sorted(test)
 
 
+def read_frozen_test(out_dir, kept_ids):
+    """Returns the ids of an existing test split that are still eligible, or None when there is none."""
+    path = os.path.join(out_dir, "test.txt")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        ids = [ln.strip() for ln in f if ln.strip()]
+    gone = [i for i in ids if i not in kept_ids]
+    if gone:
+        print(f"  frozen test ids no longer eligible (kept out of every split): {gone}")
+    return [i for i in ids if i in kept_ids]
+
+
 def write_split(out_dir, name, ids):
     """Writes one split as a plain-text file of episode ids, one per line, for
     easy diffing and version control."""
@@ -126,15 +139,25 @@ def main():
     if kept.empty:
         sys.exit("No episodes left after inclusion filtering.")
 
-    print("Generating stratified split ...")
-    train, val, test = stratified_split(
-        kept, ratios, split_cfg.get("stratify_by", []), split_cfg.get("seed", 0))
+    out_dir = split_cfg.get("out_dir", "data/splits")
+    frozen = read_frozen_test(out_dir, set(kept["episode_id"])) if split_cfg.get("freeze_test") else None
+    if frozen is not None:
+        print(f"Keeping frozen test split ({len(frozen)} episodes), splitting the rest into train/val ...")
+        rest = kept[~kept["episode_id"].isin(frozen)]
+        tv = ratios["train"] + ratios["val"]
+        train, val, extra = stratified_split(
+            rest, {"train": ratios["train"] / tv, "val": ratios["val"] / tv, "test": 0.0},
+            split_cfg.get("stratify_by", []), split_cfg.get("seed", 0))
+        val, test = sorted(val + extra), sorted(frozen)
+    else:
+        print("Generating stratified split ...")
+        train, val, test = stratified_split(
+            kept, ratios, split_cfg.get("stratify_by", []), split_cfg.get("seed", 0))
 
     overlap = (set(train) & set(val)) | (set(train) & set(test)) | (set(val) & set(test))
     if overlap:
         sys.exit(f"Split overlap detected (bug): {overlap}")
 
-    out_dir = split_cfg.get("out_dir", "data/splits")
     os.makedirs(out_dir, exist_ok=True)
     write_split(out_dir, "train", train)
     write_split(out_dir, "val", val)

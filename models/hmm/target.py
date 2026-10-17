@@ -60,7 +60,7 @@ import numpy as np
 
 from teleop_orchestrator.contracts import NULL_TARGET, Phase
 
-TIGHT_PHASES = frozenset({Phase.GRASP, Phase.TRANSPORT, Phase.PLACE})
+TIGHT_PHASES = frozenset({Phase.GRASP, Phase.TRANSPORT, Phase.PLACE, Phase.INSERT, Phase.CORRECT})
 
 # Below this EE speed (m/s), direction-of-motion is noise -- skip the
 # alignment evidence entirely rather than let a near-stationary arm's

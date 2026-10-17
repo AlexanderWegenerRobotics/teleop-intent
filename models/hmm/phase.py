@@ -347,7 +347,7 @@ class PhaseHMM:
         return self._collapse(self.state_belief)
 
     def _collapse(self, state_belief: np.ndarray) -> np.ndarray:
-        return np.bincount(self._owner, weights=state_belief, minlength=self._n_phases)
+        return Phase.pad(np.bincount(self._owner, weights=state_belief, minlength=self._n_phases))
 
     def reset(self) -> None:
         """Resets belief to the fitted prior; call at episode boundaries."""
@@ -372,7 +372,8 @@ class PhaseHMM:
             is_binary: np.ndarray | None = None,
             bernoulli_floor: float = DEFAULT_BERNOULLI_FLOOR,
             sub_states: np.ndarray | None = None,
-            feature_names: list[str] | None = None) -> "PhaseHMMParams":
+            feature_names: list[str] | None = None,
+            n_phases: int | None = None) -> "PhaseHMMParams":
         """Estimates transition, prior, and emission parameters by counting
         and per-class MLE across labeled (feature_seq, label_seq) episode pairs.
 
@@ -387,7 +388,9 @@ class PhaseHMM:
         explicit all-False mask to force the old all-Gaussian behaviour for
         an ablation.
         """
-        n = Phase.N_CLASSES
+        if n_phases is None:
+            n_phases = len(sub_states) if sub_states is not None else max(int(np.max(l)) for l in label_seqs) + 1
+        n = int(n_phases)
         n_feat = feature_seqs[0].shape[1]
 
         if is_binary is None:

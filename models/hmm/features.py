@@ -75,6 +75,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from teleop_orchestrator.contracts import SensorFrame, CANDIDATE_FEATURE_NAMES, GLOBAL_FEATURE_NAMES
+from teleop_orchestrator.contracts.features import CAND_GOAL
 
 from .held import is_holding
 
@@ -93,12 +94,42 @@ FEATURE_NAMES = [
 # contributor to the measured 5.4-nat unconditional preference for IDLE over
 # GRASP. phase.py fits these as Bernoulli instead, where the analogous term
 # is bounded by the probability floor.
-BINARY_FEATURE_NAMES = frozenset({"is_holding", "cand_dist_valid", "gaze_dist_valid"})
+BINARY_FEATURE_NAMES = frozenset({"is_holding", "cand_dist_valid", "gaze_dist_valid", "goal_valid"})
 
 # Boolean mask over FEATURE_NAMES, in the same order -- what PhaseHMM.fit
 # wants, so the Gaussian/Bernoulli split is declared once, here, next to the
 # features themselves rather than restated as indices at the fit site.
 IS_BINARY_FEATURE = np.array([n in BINARY_FEATURE_NAMES for n in FEATURE_NAMES], dtype=bool)
+
+GOAL_FEATURE_NAMES = ["goal_dxy", "goal_dz", "goal_valid"]
+
+
+def feature_names(use_goals: bool = False) -> list[str]:
+    """Phase feature names, with the goal block appended when goals are configured."""
+    return list(FEATURE_NAMES) + (list(GOAL_FEATURE_NAMES) if use_goals else [])
+
+
+def binary_mask(names) -> np.ndarray:
+    """Bernoulli/Gaussian split for an arbitrary phase feature name list."""
+    return np.array([n in BINARY_FEATURE_NAMES for n in names], dtype=bool)
+
+
+def goal_array(goals) -> np.ndarray | None:
+    """Goal positions as a [G, 3] float array, or None when no goals are configured."""
+    if goals is None or len(goals) == 0:
+        return None
+    return np.asarray(goals, dtype=np.float64).reshape(-1, 3)
+
+
+def goal_features(frame: SensorFrame, side: str, goals: np.ndarray) -> np.ndarray:
+    """Horizontal distance and height of the world EE relative to the horizontally nearest goal."""
+    ee = getattr(frame, "ee_world_pos", {}).get(side)
+    if ee is None or not np.all(np.isfinite(ee)):
+        return np.array([np.nan, np.nan, 0.0])
+    dxy = np.linalg.norm(goals[:, :2] - np.asarray(ee)[None, :2], axis=1)
+    k = int(np.argmin(dxy))
+    return np.array([dxy[k], float(ee[2] - goals[k, 2]), 1.0])
+
 
 _DIST_COL = {"left": CANDIDATE_FEATURE_NAMES.index("dist_left"),
              "right": CANDIDATE_FEATURE_NAMES.index("dist_right")}
@@ -155,8 +186,9 @@ class PhaseFeatureState:
 
 
 def phase_features(frame: SensorFrame, side: str,
-                    prev: PhaseFeatureState | None) -> tuple[np.ndarray, PhaseFeatureState]:
-    """Returns (feature_vector[9], new_state) for one arm at this frame.
+                    prev: PhaseFeatureState | None,
+                    goals: np.ndarray | None = None) -> tuple[np.ndarray, PhaseFeatureState]:
+    """Returns (feature_vector, new_state) for one arm; goal features are appended when goals is given.
 
     `prev` is None on the first call of an episode (reset); the caller is
     responsible for threading the returned state back in on the next call
@@ -174,15 +206,18 @@ def phase_features(frame: SensorFrame, side: str,
     fext_idx = [GLOBAL_FEATURE_NAMES.index(f"fext_{side}_{axis}") for axis in ("fx", "fy", "fz")]
     contact_force_norm = float(np.linalg.norm(frame.global_features[fext_idx]))
 
+    # Objects and bins only: goal rows (fixed board slots) must not change the
+    # phase vector, so a checkpoint fit without them reads the same numbers live.
+    base = frame.candidate_mask & (frame.candidate_types != CAND_GOAL)
     dist_col = _DIST_COL[side]
-    valid_dist = frame.candidate_features[frame.candidate_mask, dist_col]
+    valid_dist = frame.candidate_features[base, dist_col]
     cand_dist_valid = bool(valid_dist.size)
     min_dist = float(valid_dist.min()) if cand_dist_valid else _NO_CANDIDATE_DIST
 
-    gaze_dist_valid = bool(frame.gaze_valid and frame.candidate_mask.any())
+    gaze_dist_valid = bool(frame.gaze_valid and base.any())
     if gaze_dist_valid:
         gaze_xy = frame.global_features[_GAZE_IDX]
-        cand_uv = frame.candidate_features[frame.candidate_mask][:, _PX_IDX]
+        cand_uv = frame.candidate_features[base][:, _PX_IDX]
         gaze_dist = float(np.linalg.norm(cand_uv - gaze_xy[None, :], axis=1).min())
     else:
         gaze_dist = _NO_GAZE_DIST
@@ -196,6 +231,8 @@ def phase_features(frame: SensorFrame, side: str,
         min_dist, gaze_dist, holding_feat,
         float(cand_dist_valid), float(gaze_dist_valid),
     ], dtype=np.float64)
+    if goals is not None:
+        features = np.concatenate([features, goal_features(frame, side, goals)])
     new_state = PhaseFeatureState(gripper_width=gw, ee_pos=ee_pos, timestamp_ns=frame.timestamp_ns)
     return features, new_state
 

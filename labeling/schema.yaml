@@ -1,0 +1,25 @@
+schema_version: 2
+
+phases:
+  - {id: 0, name: IDLE,      color: "#d0d0d0", key: "0", desc: "no committed action"}
+  - {id: 1, name: APPROACH,  color: "#4e79a7", key: "1", desc: "hand moving toward the part it will grasp"}
+  - {id: 2, name: GRASP,     color: "#f28e2b", key: "2", desc: "final positioning at the part, closing, until lift"}
+  - {id: 3, name: TRANSPORT, color: "#59a14f", key: "3", desc: "part lifted, moving toward its goal"}
+  - {id: 4, name: PLACE,     color: "#b07aa1", key: "4", desc: "releasing the part and backing off"}
+  - {id: 5, name: INSERT,    color: "#e15759", key: "5", desc: "part near its slot: aligning, lowering, pushing in"}
+  - {id: 6, name: CORRECT,   color: "#edc948", key: "6", desc: "fixing a part already at its slot but not seated"}
+  - {id: 7, name: HOLD,      color: "#76b7b2", key: "7", desc: "reserved, bimanual: keeping a part steady for the other arm", reserved: true}
+  - {id: 8, name: HANDOVER,  color: "#9c755f", key: "8", desc: "reserved, bimanual: both grippers on one part", reserved: true}
+
+events:
+  - grasp_close
+  - grasp_open
+  - grasp_miss
+  - lift
+  - seated
+  - unseated
+  - push
+  - insert_attempt
+  - retract
+
+null_target: "null"

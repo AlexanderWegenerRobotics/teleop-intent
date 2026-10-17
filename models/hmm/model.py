@@ -21,13 +21,14 @@ from teleop_orchestrator.contracts import (
     SensorFrame, ArmIntent, IntentOutput, NULL_TARGET, Phase,
     CANDIDATE_FEATURE_NAMES, GLOBAL_FEATURE_NAMES,
 )
+from teleop_orchestrator.contracts.features import CAND_GOAL
 
 from metrics import classification_metrics
 
 from ..base import TrainableIntentModel
 from .features import (phase_features, PhaseFeatureState, world_ee_velocity, WorldEEState,
-                       FEATURE_NAMES)
-from .held import target_exclusion_mask
+                       FEATURE_NAMES, binary_mask, goal_array, feature_names as phase_feature_names)
+from .held import target_exclusion_mask, EXCLUSION_PHASES
 from .phase import (PhaseHMM, PhaseHMMParams, fit_emission_temperature, filter_episode,
                     sub_states_from_durations, DEFAULT_STD_FLOOR_REL, DEFAULT_TEMP_GRID,
                     DEFAULT_MAX_SUB_STATES)
@@ -45,9 +46,11 @@ class HMMIntentModel(TrainableIntentModel):
     per arm from shared, pooled parameters."""
 
     def __init__(self, phase_params: PhaseHMMParams | None = None,
-                 target_params: TargetFilterParams | None = None):
+                 target_params: TargetFilterParams | None = None, exclusion_phases=None, goals=None):
         self.phase_params = phase_params
+        self.goals = goal_array(goals)
         self.target_params = target_params
+        self.exclusion_phases = frozenset(EXCLUSION_PHASES if exclusion_phases is None else exclusion_phases)
         self._phase = {s: PhaseHMM(phase_params) for s in SIDES} if phase_params else {}
         self._target = {s: TargetStickyFilter(target_params) for s in SIDES} if target_params else {}
         self._prev_phase_state: dict[str, PhaseFeatureState | None] = {s: None for s in SIDES}
@@ -70,8 +73,9 @@ class HMMIntentModel(TrainableIntentModel):
         null_probs = {}
         pool_masks = {}
         for side in SIDES:
-            feats, self._prev_phase_state[side] = phase_features(obs, side, self._prev_phase_state[side])
-            phase_posterior = self._phase[side].step(feats)
+            feats, self._prev_phase_state[side] = phase_features(obs, side, self._prev_phase_state[side],
+                                                                   self.goals)
+            phase_posterior = Phase.pad(self._phase[side].step(feats))
             phase_estimate = int(np.argmax(phase_posterior))
 
             # A single-gripper arm holding one object can't be reaching for any
@@ -80,7 +84,9 @@ class HMMIntentModel(TrainableIntentModel):
             # (phase's min_candidate_dist above is unaffected: proximity to
             # *something* is still phase-informative even while holding it,
             # the category error only applies to "which candidate is the goal").
-            target_mask = obs.candidate_mask & ~target_exclusion_mask(obs, side, phase_estimate)
+            target_mask = obs.candidate_mask & ~target_exclusion_mask(obs, side, phase_estimate,
+                                                                      self.exclusion_phases)
+            target_mask &= obs.candidate_types != CAND_GOAL
 
             # ee_vel/ee_pos here are DELIBERATELY NOT phase's own ee_vel
             # (feats[:3]): phase uses O_T_EE (every-frame, base frame), while
@@ -119,6 +125,11 @@ class HMMIntentModel(TrainableIntentModel):
                             extras={"target_null_prob": null_probs,
                                     "target_pool_mask": pool_masks})
 
+    @property
+    def n_phases(self) -> int:
+        """Phase classes this model predicts (5 for sorting checkpoints, 7 for FMB)."""
+        return int(self.phase_params.transition.shape[0]) if self.phase_params is not None else Phase.N_CLASSES
+
     def fit(self, train_data: list[dict], val_data: list[dict], config: dict) -> dict:
         """train_data/val_data: lists of per-episode dicts, one per (episode,
         side) pair, each with:
@@ -153,20 +164,27 @@ class HMMIntentModel(TrainableIntentModel):
         label_seqs = [d["phase_labels"] for d in train_data]
 
         n_feat = feature_seqs[0].shape[1]
-        is_binary = np.zeros(n_feat, dtype=bool) if config.get("gaussian_only") else None
+        names = phase_feature_names(self.goals is not None)
+        if len(names) != n_feat:
+            raise ValueError(f"training arrays have {n_feat} phase features but the model expects "
+                             f"{len(names)} ({', '.join(names)}) -- build them with the same goals")
+        is_binary = np.zeros(n_feat, dtype=bool) if config.get("gaussian_only") else binary_mask(names)
 
         # Chain lengths are read off the TRAINING labels' segment durations --
         # never val or test, since they are structural parameters of the model
         # like the transition counts, not tuned hyperparameters.
         sub_cfg = config.get("sub_states", "auto")
+        n_phases = int(config.get("n_phases")
+                       or (len(sub_cfg) if isinstance(sub_cfg, (list, tuple, np.ndarray))
+                           else max(int(np.max(l)) for l in label_seqs) + 1))
         history: dict = {}
         if sub_cfg == "auto":
             sub_states, sub_info = sub_states_from_durations(
-                label_seqs, Phase.N_CLASSES,
+                label_seqs, n_phases,
                 max_sub_states=int(config.get("max_sub_states", DEFAULT_MAX_SUB_STATES)))
             history["sub_state_selection"] = sub_info
         elif sub_cfg is None:
-            sub_states = np.ones(Phase.N_CLASSES, dtype=int)
+            sub_states = np.ones(n_phases, dtype=int)
         else:
             sub_states = np.asarray(sub_cfg, dtype=int)
 
@@ -176,6 +194,8 @@ class HMMIntentModel(TrainableIntentModel):
             tie_covariance=bool(config.get("tie_covariance", False)),
             is_binary=is_binary,
             sub_states=sub_states,
+            n_phases=n_phases,
+            feature_names=names,
         )
         history["sub_states"] = self.phase_params.chain_lengths.tolist()
         history["duration_stats"] = self.phase_params.duration_stats()
@@ -239,6 +259,8 @@ class HMMIntentModel(TrainableIntentModel):
             rho_loose=self.target_params.rho_loose, rho_tight=self.target_params.rho_tight,
             sigma=self.target_params.sigma, null_prior=self.target_params.null_prior,
             sigma_align=self.target_params.sigma_align,
+            exclusion_phases=np.array(sorted(self.exclusion_phases), dtype=int),
+            goals=self.goals if self.goals is not None else np.zeros((0, 3)),
         )
 
     def load(self, path: str) -> None:
@@ -263,14 +285,18 @@ class HMMIntentModel(TrainableIntentModel):
             sub_states=z["sub_states"].astype(int) if "sub_states" in z else None,
             feature_names=feature_names,
         )
+        self.goals = goal_array(z["goals"]) if "goals" in z else None
+        expected = phase_feature_names(self.goals is not None)
         n_ckpt = self.phase_params.emission_mean.shape[1]
-        if n_ckpt != len(FEATURE_NAMES):
+        if n_ckpt != len(expected):
             raise ValueError(
                 f"checkpoint {path} was fit on {n_ckpt} phase features but features.py now "
-                f"produces {len(FEATURE_NAMES)} ({', '.join(FEATURE_NAMES)}). Re-fit it with "
+                f"produces {len(expected)} ({', '.join(expected)}). Re-fit it with "
                 f"models.hmm.train -- scoring a checkpoint against a different feature vector "
                 f"silently misaligns every emission column.")
         sigma_align = float(z["sigma_align"]) if "sigma_align" in z else np.inf
+        self.exclusion_phases = (frozenset(int(p) for p in z["exclusion_phases"]) if "exclusion_phases" in z
+                                 else frozenset(EXCLUSION_PHASES))
         self.target_params = TargetFilterParams(rho_loose=float(z["rho_loose"]), rho_tight=float(z["rho_tight"]),
                                                  sigma=float(z["sigma"]), null_prior=float(z["null_prior"]),
                                                  sigma_align=sigma_align)

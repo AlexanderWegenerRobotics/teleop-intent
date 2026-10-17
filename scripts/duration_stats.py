@@ -90,7 +90,7 @@ def gather_durations(store_root: str, episode_ids: list[str]) -> dict[int, list[
             if not label_loader.is_genuinely_labeled(ep):
                 continue
             n_ep += 1
-            for side in SIDES:
+            for side in label_loader.labeled_sides(ep, SIDES):
                 phase, _target = label_loader.load_arm_labels(ep, side)
                 for k, d in segment_durations(phase):
                     by_phase[k].append(d)

@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "teleop-intent"
+version = "0.1.0"
+description = "Intent-recognition models (HMM/GRU/transformer). Namespaced as teleop_intent so it can be imported alongside teleop-policy (which also has a top-level `models` package) by teleop-orchestrator. teleop_orchestrator must already be installed in the same environment -- not declared as a dependency here since it isn't published to an index."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+]
+
+[tool.setuptools]
+# Explicit package list rather than packages.find: this repo's layout is flat
+# (models/, metrics.py, labels.py etc. at repo root, no __init__.py at the
+# models/ level), so it's installed twice under two names from the same
+# files -- unprefixed, for the repo's own scripts/tests run from repo root
+# exactly as before; and under teleop_intent, for teleop-orchestrator to
+# import without colliding with teleop-policy's own top-level `models`
+# package. metrics is the one module the model classes reach via a bare
+# absolute import (models/hmm/model.py, models/hmm/phase.py) rather than a
+# relative one, so it needs the same dual registration to resolve under the
+# teleop_intent-prefixed import path.
+packages = [
+    "teleop_intent",
+    "teleop_intent.models",
+    "teleop_intent.models.hmm",
+    "teleop_intent.models.gru",
+    "teleop_intent.models.transformer",
+    "teleop_intent.models.task_prior",
+]
+py-modules = ["metrics"]
+
+[tool.setuptools.package-dir]
+teleop_intent = "."

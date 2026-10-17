@@ -400,8 +400,8 @@ def test_fixed_emission_beats_the_v7_emission_on_realistic_data():
     assert np.ptp(v7.normalizer_bias()) > 2.0, "fixture no longer reproduces the v7 bias"
     assert np.ptp(v8.normalizer_bias()) < 2.0, f"bias still large: {v8.normalizer_bias()}"
     assert m8["macro_f1"] > m7["macro_f1"] + 0.2, f"{m7['macro_f1']:.3f} -> {m8['macro_f1']:.3f}"
-    assert m7["per_class_recall"].min() < 0.5, "fixture no longer starves a phase under v7"
-    assert m8["per_class_recall"].min() > 0.6, (
+    assert np.nanmin(m7["per_class_recall"]) < 0.5, "fixture no longer starves a phase under v7"
+    assert np.nanmin(m8["per_class_recall"]) > 0.6, (
         f"a phase is still starved: {dict(zip(Phase.NAMES.values(), m8['per_class_recall'].round(2)))}")
 
 

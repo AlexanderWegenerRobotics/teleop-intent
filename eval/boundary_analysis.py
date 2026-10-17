@@ -275,7 +275,7 @@ def main():
         if records is None:
             continue
         n += 1
-        for side in SIDES:
+        for side in records:
             t = np.asarray(records[side]["true_phase"])
             p = np.asarray(records[side]["pred_phase"])
             per_side[side]["true"].append(t)
@@ -287,6 +287,8 @@ def main():
     print(f"  analysed {n} labeled episode(s)")
 
     for side in SIDES:
+        if not per_side[side]["true"]:
+            continue
         report_bucketed_accuracy(side,
                                  np.concatenate(per_side[side]["true"]),
                                  np.concatenate(per_side[side]["pred"]),

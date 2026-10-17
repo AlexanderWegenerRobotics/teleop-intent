@@ -39,7 +39,7 @@ import numpy as np
 
 from teleop_orchestrator.contracts import (SensorFrame, GLOBAL_FEATURE_NAMES,
                                             CANDIDATE_FEATURE_NAMES, Phase)
-from teleop_orchestrator.contracts.features import CAND_OBJECT
+from teleop_orchestrator.contracts.features import CAND_OBJECT, CAND_GOAL
 
 _DIST_COL = {"left": CANDIDATE_FEATURE_NAMES.index("dist_left"),
              "right": CANDIDATE_FEATURE_NAMES.index("dist_right")}
@@ -81,8 +81,15 @@ def held_object_mask(frame: SensorFrame, side: str) -> np.ndarray:
     if not is_holding(frame, side):
         return held
     is_object = (frame.candidate_types == CAND_OBJECT) & frame.candidate_mask
-    dist_col = _DIST_COL[side]
-    dists = np.where(is_object, frame.candidate_features[:, dist_col], np.inf)
+    dists = np.where(is_object, frame.candidate_features[:, _DIST_COL[side]], np.inf)
+    # World EE and object positions when both exist: the intent-log EE behind
+    # the dist column is 7-14 cm off, which picked a neighbouring peg in about
+    # a quarter of held GRASP frames on FMB (010); world positions got all of them.
+    world, ee = frame.candidate_world_pos, frame.ee_world_pos.get(side)
+    if world is not None and ee is not None:
+        wd = np.linalg.norm(world - np.asarray(ee, dtype=np.float64)[None, :], axis=1)
+        if np.isfinite(wd[is_object]).any():
+            dists = np.where(is_object & np.isfinite(wd), wd, np.inf)
     held[int(np.argmin(dists))] = True
     return held
 
@@ -109,7 +116,7 @@ EXCLUSION_PHASES = frozenset({Phase.TRANSPORT, Phase.PLACE})
 
 
 def target_exclusion_mask(frame: SensorFrame, side: str,
-                          phase: int | None = None) -> np.ndarray:
+                          phase: int | None = None, phases=EXCLUSION_PHASES) -> np.ndarray:
     """Candidates to exclude from the target pool while this arm is carrying
     something: every CAND_OBJECT-type candidate, not just the specific one
     held -- a full gripper can't be reaching for a different object either.
@@ -129,8 +136,57 @@ def target_exclusion_mask(frame: SensorFrame, side: str,
     labelling guide, not in this function.
     """
     n = len(frame.candidate_mask)
-    if phase is not None and int(phase) not in EXCLUSION_PHASES:
+    if phase is not None and int(phase) not in phases:
         return np.zeros(n, dtype=bool)
     if not is_holding(frame, side):
         return np.zeros(n, dtype=bool)
     return (frame.candidate_types == CAND_OBJECT) & frame.candidate_mask
+
+
+def part_type(name: str) -> str:
+    """Part type an object name maps to, the key goals are typed by (spare_peg_1_b -> peg_1), as in the auto-labeler."""
+    parts = name.replace("spare_", "").split("_")
+    return "_".join(parts[:2]) if len(parts) >= 2 else name
+
+
+def held_part_index(frame: SensorFrame, side: str) -> int | None:
+    """Candidate index of the object this arm is holding, or None."""
+    held = held_object_mask(frame, side)
+    return int(np.argmax(held)) if held.any() else None
+
+
+def occupied_goal_mask(frame: SensorFrame, own_part: str | None, goal_types: dict, occupied_m: float) -> np.ndarray:
+    """Goal candidates already filled by a type-matching part other than own_part (the arm's current or last held part).
+
+    own_part keeps the slot the arm just seated a part in selectable through release and retreat;
+    it drops out once the arm grasps the next part. Needs candidate_world_pos and candidate_names.
+    """
+    n = len(frame.candidate_mask)
+    out = np.zeros(n, dtype=bool)
+    world, names = frame.candidate_world_pos, frame.candidate_names
+    if world is None or len(names) < n:
+        return out
+    finite = np.all(np.isfinite(world), axis=1)
+    objs = np.flatnonzero((frame.candidate_types == CAND_OBJECT) & frame.candidate_mask & finite)
+    objs = [o for o in objs if names[o] and names[o] != own_part]
+    for g in np.flatnonzero((frame.candidate_types == CAND_GOAL) & frame.candidate_mask & finite):
+        gt = goal_types.get(names[g])
+        out[g] = any(part_type(names[o]) == gt and np.linalg.norm(world[o] - world[g]) < occupied_m for o in objs)
+    return out
+
+
+def pinned_exclusion_mask(frame: SensorFrame, side: str, held: int | None = None) -> np.ndarray:
+    """While holding, every object except the held one, in any phase: a full gripper pins the target to its part.
+
+    Goals are untouched, so the target can still move from the part to its slot.
+    held overrides the nearest-object identification (the feature builder latches it).
+    """
+    n = len(frame.candidate_mask)
+    if held is None:
+        mask = held_object_mask(frame, side)
+    else:
+        mask = np.zeros(n, dtype=bool)
+        mask[held] = True
+    if not mask.any():
+        return np.zeros(n, dtype=bool)
+    return (frame.candidate_types == CAND_OBJECT) & frame.candidate_mask & ~mask

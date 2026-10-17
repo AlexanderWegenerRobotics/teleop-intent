@@ -30,7 +30,7 @@ except ImportError:
 # Phase enum (shared by playback, labeling, and the old segment.py schema)
 # ---------------------------------------------------------------------------
 
-PHASE_NAMES = {0: "IDLE", 1: "APPROACH", 2: "GRASP", 3: "TRANSPORT", 4: "PLACE"}
+PHASE_NAMES = {0: "IDLE", 1: "APPROACH", 2: "GRASP", 3: "TRANSPORT", 4: "PLACE", 5: "INSERT", 6: "CORRECT"}
 PHASE_IDS = {name: pid for pid, name in PHASE_NAMES.items()}  # "IDLE" -> 0
 
 

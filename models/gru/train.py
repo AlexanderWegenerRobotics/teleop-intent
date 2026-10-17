@@ -45,19 +45,26 @@ import h5py
 import numpy as np
 
 from teleop_orchestrator.sources import ReplaySource
-from teleop_orchestrator.contracts import NULL_TARGET, Phase
+from teleop_orchestrator.contracts import NULL_TARGET, Phase, CANDIDATE_FEATURE_NAMES, GLOBAL_FEATURE_NAMES
+from teleop_orchestrator.contracts.features import CAND_GOAL
 
 import labels as label_loader
+import task_config
 from metrics import classification_metrics
 
-from .features import EpisodeFeatureBuilder, ARM_FEATURE_NAMES, candidate_feature_names
+from .features import EpisodeFeatureBuilder, arm_feature_names, candidate_feature_names, regaze
 from .model import GRUIntentModel, SIDES, _require_torch
 
 TRAIN_DEFAULTS = dict(
     epochs=60, lr=2e-3, weight_decay=1e-4, tbptt=256, grad_clip=1.0,
     target_loss_weight=1.0, patience=12, seed=0, phase_class_weight="inverse",
     checkpoint_path=None,   # written on every val improvement; see fit_model
+    gaze_dropout=0.0, gaze_dropout_span=15, select="best",
 )
+
+_PX = [CANDIDATE_FEATURE_NAMES.index("px_u"), CANDIDATE_FEATURE_NAMES.index("px_v")]
+_GAZE = [GLOBAL_FEATURE_NAMES.index("gaze_x"), GLOBAL_FEATURE_NAMES.index("gaze_y")]
+VISIBLE_RAY = 2.0   # |normalized ray| beyond this is off-image or NOT_PROJECTED
 
 
 class _GracefulStop:
@@ -111,21 +118,36 @@ def read_split(path: str) -> list[str]:
         return [ln.strip() for ln in f if ln.strip()]
 
 
-def build_episode_arrays(hdf5_path: str, rich: bool = False) -> list[dict] | None:
-    """One dict per (episode, side), or None if the episode has no real labels."""
+def replay_goals(goal_targets: dict | None) -> dict | None:
+    """Goal name -> position for ReplaySource, in task-config order (the label indices assume that order)."""
+    return dict(zip(goal_targets["names"], goal_targets["pos"])) if goal_targets else None
+
+
+def build_episode_arrays(hdf5_path: str, rich: bool = False, exclusion_phases=None,
+                         goals=None, goal_targets=None, pin_held: bool = False) -> list[dict] | None:
+    """One dict per (episode, labeled side), or None if the episode has no real labels."""
     with h5py.File(hdf5_path, "r") as ep:
         if not label_loader.is_genuinely_labeled(ep):
             return None
-        per_side = {s: label_loader.load_arm_labels(ep, s) for s in SIDES}
+        per_side = {s: label_loader.load_arm_labels(ep, s, goal_targets)
+                    for s in label_loader.labeled_sides(ep, SIDES)}
 
-    src = ReplaySource(hdf5_path, load_images=False)
+    src = ReplaySource(hdf5_path, load_images=False, goals=replay_goals(goal_targets))
     frames = [src.frame_at(t) for t in range(len(src))]
     src.close()
+    raw_gaze = {
+        "gaze": np.stack([fr.global_features[_GAZE] for fr in frames]).astype(np.float64),
+        "gaze_valid": np.array([bool(fr.gaze_valid) for fr in frames]),
+        "cand_uv": np.stack([fr.candidate_features[:, _PX] for fr in frames]).astype(np.float64),
+        "phase_mask": np.stack([fr.candidate_mask & (fr.candidate_types != CAND_GOAL) for fr in frames]),
+    }
+    raw_gaze["visible"] = (np.stack([fr.candidate_mask for fr in frames])
+                           & np.all(np.abs(raw_gaze["cand_uv"]) < VISIBLE_RAY, axis=2))
 
     out = []
-    for side in SIDES:
-        phase_labels, target_labels = per_side[side]
-        b = EpisodeFeatureBuilder(side, rich=rich)
+    for side, (phase_labels, target_labels) in per_side.items():
+        b = EpisodeFeatureBuilder(side, rich=rich, exclusion_phases=exclusion_phases, goals=goals,
+                                  goal_targets=goal_targets, pin_held=pin_held)
         b.reset()
         arm, cand, mask, raw = [], [], [], []
         prev_phase = None            # no exclusion on the first frame of an episode
@@ -147,17 +169,21 @@ def build_episode_arrays(hdf5_path: str, rich: bool = False) -> list[dict] | Non
             "target": np.asarray(target_labels, dtype=np.int64),
             "episode_id": os.path.basename(os.path.dirname(hdf5_path)),
             "side": side,
+            **raw_gaze,
         })
     return out
 
 
-def gather(store_root: str, episode_ids: list[str], rich: bool = False) -> list[dict]:
+def gather(store_root: str, episode_ids: list[str], rich: bool = False, exclusion_phases=None,
+           goals=None, goal_targets=None, pin_held: bool = False) -> list[dict]:
+    """Loads every labeled episode in episode_ids as one entry per (episode, side)."""
     data, n = [], 0
     for eid in sorted(episode_ids):
         path = os.path.join(store_root, eid, "episode.hdf5")
         if not os.path.exists(path):
             continue
-        arrays = build_episode_arrays(path, rich=rich)
+        arrays = build_episode_arrays(path, rich=rich, exclusion_phases=exclusion_phases, goals=goals,
+                                      goal_targets=goal_targets, pin_held=pin_held)
         if arrays is None:
             continue
         n += 1
@@ -265,6 +291,47 @@ def target_index_masked(target_labels: np.ndarray, mask: np.ndarray) -> tuple[np
     return np.where(unreachable, IGNORE_INDEX, idx).astype(np.int64), unreachable
 
 
+class GazeDropout:
+    """Training-only gaze corruption, resampled every epoch.
+
+    About a fraction p of frames is corrupted, in spans of ~span frames (a
+    fixation, not single-frame flicker): half the spans mark gaze invalid, the
+    other half move the gaze onto one visible candidate other than the
+    labelled target, keeping the frame's real gaze-to-target offset (on FMB
+    gaze sits ~0.06 ray units above the grasped part's origin). Teaches the
+    model to fall back on kinematics when gaze is missing or disagrees. Never
+    applied to val/test or at runtime.
+    """
+
+    def __init__(self, p: float, span: int, cand_names: list[str], seed: int = 0):
+        self.p, self.span, self.cand_names = float(p), max(1, int(span)), cand_names
+        self.rng = np.random.default_rng(seed)
+
+    def apply(self, d: dict) -> tuple[np.ndarray, np.ndarray]:
+        """Returns (arm, cand) for one sequence with fresh corruption."""
+        T, n = d["cand_uv"].shape[:2]
+        gaze, valid = d["gaze"].copy(), d["gaze_valid"].copy()
+        for _ in range(self.rng.binomial(T, self.p / self.span)):
+            s = int(self.rng.integers(T))
+            e = min(T, s + (int(self.rng.integers(self.span // 2, self.span + self.span // 2 + 1))
+                            if self.span > 1 else 1))
+            pick = d["visible"][s] & (np.arange(n) != d["target"][s])
+            if self.rng.random() < 0.5 or not pick.any():
+                valid[s:e] = False
+                continue
+            k = int(self.rng.choice(np.flatnonzero(pick)))
+            on = d["visible"][s:e, k]
+            tgt = d["target"][s:e]
+            rel = np.zeros((e - s, 2))
+            has = (tgt >= 0) & d["gaze_valid"][s:e]
+            rel[has] = d["gaze"][s:e][has] - d["cand_uv"][s:e][has, tgt[has]]
+            gaze[s:e][on] = d["cand_uv"][s:e, k][on] + rel[on]
+            valid[s:e] = on
+        arm, cand = regaze(d["arm"], d["cand"], self.cand_names, d["mask_raw"], d["phase_mask"],
+                           d["cand_uv"], gaze, valid)
+        return arm.astype(np.float32), cand.astype(np.float32)
+
+
 def compute_norm_stats(data: list[dict]):
     """Mean/std per feature over the TRAINING split only.
 
@@ -282,18 +349,26 @@ def compute_norm_stats(data: list[dict]):
             np.asarray(c_mean, dtype=np.float64), tidy(c_std).astype(np.float64))
 
 
-def phase_class_weights(data: list[dict], mode: str):
-    counts = np.zeros(Phase.N_CLASSES)
+def phase_class_weights(data: list[dict], mode: str, n_phases: int = Phase.N_CLASSES):
+    """Per-class loss weights over the classes present in training; absent classes get 0."""
+    counts = np.zeros(n_phases)
     for d in data:
-        counts += np.bincount(d["phase"], minlength=Phase.N_CLASSES)
-    counts = np.maximum(counts, 1.0)
+        counts += np.bincount(d["phase"], minlength=n_phases)[:n_phases]
     if mode == "none":
-        w = np.ones(Phase.N_CLASSES)
-    elif mode == "sqrt":
-        w = 1.0 / np.sqrt(counts)
-    else:                                   # "inverse"
-        w = 1.0 / counts
-    return w / w.mean(), counts
+        return np.ones(n_phases), counts
+    present = counts > 0
+    safe = np.maximum(counts, 1.0)
+    w = 1.0 / np.sqrt(safe) if mode == "sqrt" else 1.0 / safe
+    w = np.where(present, w, 0.0)
+    return w / w[present].mean(), counts
+
+
+def check_label_range(data: list[dict], n_phases: int) -> None:
+    """Fails early when labels contain phases the model has no output for."""
+    top = max((int(d["phase"].max()) for d in data if len(d["phase"])), default=0)
+    if top >= n_phases:
+        raise SystemExit(f"labels contain phase id {top} ({Phase.NAMES.get(top, '?')}) but the model "
+                         f"predicts {n_phases} phases -- pass --dataset or --n-phases {top + 1}")
 
 
 def fit_model(model: GRUIntentModel, train_data: list[dict], val_data: list[dict],
@@ -316,12 +391,14 @@ def fit_model(model: GRUIntentModel, train_data: list[dict], val_data: list[dict
     d_cand = train_data[0]["cand"].shape[2]
     model.build(d_arm, d_cand)
     net = model.net
+    n_ph = model.n_phases
+    check_label_range(train_data + list(val_data or []), n_ph)
 
-    w, counts = phase_class_weights(train_data, str(cfg["phase_class_weight"]))
+    w, counts = phase_class_weights(train_data, str(cfg["phase_class_weight"]), n_ph)
     print("  phase frame counts: " + "  ".join(
-        f"{Phase.NAMES[i]}={int(counts[i])}" for i in range(Phase.N_CLASSES)))
+        f"{Phase.NAMES[i]}={int(counts[i])}" for i in range(n_ph)))
     print("  phase loss weights: " + "  ".join(
-        f"{Phase.NAMES[i]}={w[i]:.2f}" for i in range(Phase.N_CLASSES)))
+        f"{Phase.NAMES[i]}={w[i]:.2f}" for i in range(n_ph)))
     weight = torch.as_tensor(w, dtype=torch.float32)
 
     opt = torch.optim.AdamW(net.parameters(), lr=float(cfg["lr"]),
@@ -334,14 +411,23 @@ def fit_model(model: GRUIntentModel, train_data: list[dict], val_data: list[dict
     # copies 116 times a pass for no benefit; the arrays total ~10 MB, so
     # holding them costs nothing worth measuring.
     _cache: dict[int, tuple] = {}
+    _aug: dict[int, tuple] = {}
+    dropout = None
+    if float(cfg["gaze_dropout"]) > 0:
+        dropout = GazeDropout(cfg["gaze_dropout"], cfg["gaze_dropout_span"],
+                              candidate_feature_names(cfg.get("rich", False), bool(cfg.get("goal_targets"))),
+                              seed=int(cfg["seed"]))
+        print(f"  gaze dropout p={cfg['gaze_dropout']} span={cfg['gaze_dropout_span']} (train split only)")
+    select_last = cfg["select"] == "last"
 
     def tensors(d):
         key = id(d)
         cached = _cache.get(key)
         if cached is not None:
             return cached
-        arm = (d["arm"] - model.norm_mean) / model.norm_std
-        cand = (d["cand"] - model.cand_mean) / model.cand_std
+        arm0, cand0 = _aug.get(key, (d["arm"], d["cand"]))
+        arm = (arm0 - model.norm_mean) / model.norm_std
+        cand = (cand0 - model.cand_mean) / model.cand_std
         tgt_idx, _bad = target_index_masked(d["target"], d["mask"])
         out = (torch.as_tensor(arm[None], dtype=torch.float32),
                torch.as_tensor(cand[None], dtype=torch.float32),
@@ -368,7 +454,7 @@ def fit_model(model: GRUIntentModel, train_data: list[dict], val_data: list[dict
                 if scorable.any():
                     tgt_ok += int((tl[0].argmax(-1).numpy()[scorable] == idx[scorable]).sum())
                     tgt_n += int(scorable.sum())
-        m = classification_metrics(true, pred, Phase.N_CLASSES)
+        m = classification_metrics(true, pred, n_ph)
         m["target_accuracy"] = tgt_ok / max(tgt_n, 1)
         return m
 
@@ -397,6 +483,10 @@ def fit_model(model: GRUIntentModel, train_data: list[dict], val_data: list[dict
         for epoch in range(int(cfg["epochs"])):
             net.train()
             np.random.shuffle(order)
+            if dropout is not None:
+                for d in train_data:
+                    _aug[id(d)] = dropout.apply(d)
+                    _cache.pop(id(d), None)
             tot_p, tot_t, nb, t0 = 0.0, 0.0, 0, time.time()
             for i in order:
                 if stop.requested:
@@ -412,7 +502,7 @@ def fit_model(model: GRUIntentModel, train_data: list[dict], val_data: list[dict
                     # unbroken (as it must, to match deployment) but the gradient
                     # does not reach back into the previous chunk.
                     h = h.detach()
-                    loss_p = F.cross_entropy(pl.reshape(-1, Phase.N_CLASSES),
+                    loss_p = F.cross_entropy(pl.reshape(-1, n_ph),
                                              ph[:, s:e].reshape(-1), weight=weight)
                     # ignore_index drops frames whose labelled target the mask
                     # excludes; if a chunk is entirely such frames the result is
@@ -450,18 +540,23 @@ def fit_model(model: GRUIntentModel, train_data: list[dict], val_data: list[dict
                       f"val macroF1 {m['macro_f1']:.3f}  acc {m['accuracy']:.3f}  "
                       f"target {m['target_accuracy']:.3f}  ({row['secs']:.0f}s)"
                       + ("  [partial epoch]" if stop.requested else ""))
-                if improved:
+                if select_last:
+                    snapshot(f"epoch {epoch}")
+                elif improved:
                     snapshot(f"epoch {epoch} (val macro F1 {m['macro_f1']:.3f})")
 
             if stop.requested:
                 interrupted = True
                 print(f"  stopped by request at epoch {epoch}")
                 break
-            if m and epoch - best["epoch"] >= int(cfg["patience"]):
+            if m and not select_last and epoch - best["epoch"] >= int(cfg["patience"]):
                 print(f"  early stop: no val improvement for {cfg['patience']} epochs")
                 break
 
-    if best["state"] is not None:
+    if select_last:
+        print(f"  kept last epoch {history[-1]['epoch'] if history else -1} (--select last; best val was epoch "
+              f"{best['epoch']}, {best['macro_f1']:.3f})")
+    elif best["state"] is not None:
         # Selection on val macro F1, not on the last epoch and not on val loss.
         # Applies to an interrupted run too: stopping early should give you the
         # best model the run found, not whatever it happened to hold when the
@@ -518,15 +613,16 @@ def shuffle_features_in_time(data: list[dict], seed: int = 0) -> list[dict]:
         e["arm"] = d["arm"][perm]
         e["cand"] = d["cand"][perm]
         e["mask"] = d["mask"][perm]
+        for k in ("mask_raw", "gaze", "gaze_valid", "cand_uv", "phase_mask", "visible"):
+            if k in d:
+                e[k] = d[k][perm]
         out.append(e)
     return out
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--store-root", required=True)
-    ap.add_argument("--train-split", default="data/splits/train.txt")
-    ap.add_argument("--val-split", default="data/splits/val.txt")
+    task_config.add_dataset_args(ap)
     ap.add_argument("--out", default="checkpoints/gru/v1.pt")
     ap.add_argument("--hidden", type=int, default=64)
     ap.add_argument("--layers", type=int, default=1)
@@ -549,24 +645,42 @@ def main():
                     help="ABLATION: same weights and parameter count, but the recurrence "
                          "restarts every frame. Isolates whether the GRU's advantage comes "
                          "from memory or merely from being a better per-frame classifier")
+    ap.add_argument("--gaze-dropout", type=float, default=0.0,
+                    help="fraction of training frames whose gaze is corrupted (invalid, or held on another "
+                         "candidate than the label); 0 = off. Train split only")
+    ap.add_argument("--gaze-dropout-span", type=int, default=TRAIN_DEFAULTS["gaze_dropout_span"],
+                    help="mean length of a corrupted stretch in frames; 1 = independent per frame")
+    ap.add_argument("--select", default="best", choices=["best", "last"],
+                    help="best = restore the best val macro F1 epoch (early stopping); last = train exactly "
+                         "--epochs and keep the final weights (for seed comparisons)")
     ap.add_argument("--shuffled-control", action="store_true",
                     help="train on time-shuffled features to measure the script-only floor")
     args = ap.parse_args()
+    ds = task_config.resolve(args)
 
     cfg = dict(hidden=args.hidden, layers=args.layers, dropout=args.dropout, rich=args.rich,
-               memoryless=args.memoryless,
-               epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
+               memoryless=args.memoryless, n_phases=ds["n_phases"],
+               held_exclusion_phases=ds["held_exclusion_phases"], goals=ds["goals"],
+               goal_targets=ds["goal_targets"], epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
                tbptt=args.tbptt, patience=args.patience, seed=args.seed,
                phase_class_weight=args.phase_class_weight, num_threads=args.num_threads,
+               pin_held=ds["pin_held"], gaze_dropout=args.gaze_dropout,
+               gaze_dropout_span=args.gaze_dropout_span, select=args.select,
                # Lets fit_model write the best model as it goes, so Ctrl-C or a
                # crash never costs more than the epochs since the last
                # improvement.
                checkpoint_path=args.out)
 
+    print(f"task {ds['task']}: {ds['n_phases']} phases, held exclusion in "
+          f"{[Phase.NAMES[p] for p in ds['held_exclusion_phases']] or 'no phase'}")
     print("Gathering train split...")
-    train_data = gather(args.store_root, read_split(args.train_split), rich=args.rich)
+    train_data = gather(ds["store_root"], read_split(ds["train_split"]), rich=args.rich,
+                        exclusion_phases=ds["held_exclusion_phases"], goals=ds["goals"],
+                        goal_targets=ds["goal_targets"], pin_held=ds["pin_held"])
     print("Gathering val split...")
-    val_data = gather(args.store_root, read_split(args.val_split), rich=args.rich)
+    val_data = gather(ds["store_root"], read_split(ds["val_split"]), rich=args.rich,
+                      exclusion_phases=ds["held_exclusion_phases"], goals=ds["goals"],
+                      goal_targets=ds["goal_targets"], pin_held=ds["pin_held"])
     if not train_data:
         raise SystemExit("No labeled training episodes found -- check --store-root and the split file")
 
@@ -575,9 +689,13 @@ def main():
         train_data = shuffle_features_in_time(train_data, seed=args.seed)
         val_data = shuffle_features_in_time(val_data, seed=args.seed + 1)
 
-    print(f"\narm features ({len(ARM_FEATURE_NAMES)}): {', '.join(ARM_FEATURE_NAMES)}")
-    names = candidate_feature_names(args.rich)
-    print(f"candidate features ({len(names)}): {', '.join(names)}\n")
+    arm_names = arm_feature_names(ds["goals"])
+    print(f"\narm features ({len(arm_names)}): {', '.join(arm_names)}")
+    names = candidate_feature_names(args.rich, bool(ds["goal_targets"]))
+    print(f"candidate features ({len(names)}): {', '.join(names)}")
+    gt = ds["goal_targets"]
+    print(f"goal candidates: {', '.join(gt['names'])} (target in {[Phase.NAMES[p] for p in gt['phases']]})\n"
+          if gt else "goal candidates: none\n")
 
     if args.memoryless:
         print("\nMEMORYLESS ABLATION: recurrence restarts every frame; parameter count "

@@ -18,6 +18,7 @@ import numpy as np
 NULL_TARGET = -1
 CAND_OBJECT = 0
 CAND_BIN = 1
+CAND_GOAL = 2
 
 CANDIDATE_FEATURE_NAMES = ["px_u", "px_v", "dist_left", "dist_right"]
 GLOBAL_FEATURE_NAMES = (
@@ -28,9 +29,17 @@ GLOBAL_FEATURE_NAMES = (
 
 
 class Phase:
-    IDLE, APPROACH, GRASP, TRANSPORT, PLACE = 0, 1, 2, 3, 4
-    N_CLASSES = 5
-    NAMES = {0: "idle", 1: "approach", 2: "grasp", 3: "transport", 4: "place"}
+    IDLE, APPROACH, GRASP, TRANSPORT, PLACE, INSERT, CORRECT = 0, 1, 2, 3, 4, 5, 6
+    N_CLASSES = 7
+    NAMES = {0: "idle", 1: "approach", 2: "grasp", 3: "transport", 4: "place", 5: "insert", 6: "correct"}
+
+    @staticmethod
+    def pad(posterior):
+        """Zero-pads a posterior from a model with fewer phases to N_CLASSES."""
+        p = np.asarray(posterior, dtype=np.float64)
+        if p.shape[-1] >= Phase.N_CLASSES:
+            return p
+        return np.concatenate([p, np.zeros(p.shape[:-1] + (Phase.N_CLASSES - p.shape[-1],))], axis=-1)
 
 
 class SensorFrame:  # pragma: no cover - placeholder, tests build arrays directly
@@ -65,6 +74,8 @@ def install() -> None:
         setattr(contracts, name, value)
     features.CAND_OBJECT = CAND_OBJECT
     features.CAND_BIN = CAND_BIN
+    features.CAND_GOAL = CAND_GOAL
+    features.N_EE_SLOTS = 2
     features.candidate_names = lambda intent: []
     contracts.features = features
     sources.ReplaySource = object

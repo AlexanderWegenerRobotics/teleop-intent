@@ -44,7 +44,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np  # noqa: E402
 
-METRICS = ("phase_macro_f1", "phase_accuracy", "target_accuracy_given_committed")
+METRICS = ("phase_macro_f1", "phase_accuracy", "target_accuracy_given_committed",
+           "target_accuracy_gaze_off_label", "target_accuracy_goal")
 
 
 def load(report_dir: str) -> dict:

@@ -69,7 +69,7 @@ from teleop_orchestrator.contracts import (
 )
 
 from ..base import TrainableIntentModel
-from .features import (ARM_FEATURE_NAMES, candidate_feature_names, EpisodeFeatureBuilder)
+from .features import (arm_feature_names, candidate_feature_names, EpisodeFeatureBuilder)
 
 SIDES = ("left", "right")
 
@@ -98,6 +98,11 @@ DEFAULTS = dict(
     cand_hidden=32,     # width of the target head's scoring MLP
     rich=False,         # matched-to-HMM candidate features by default
     memoryless=False,   # ABLATION: identical parameters, no memory. See IntentGRU.
+    n_phases=None,
+    held_exclusion_phases=None,
+    goals=None,
+    goal_targets=None,
+    pin_held=False,
 )
 
 
@@ -107,7 +112,8 @@ if _TORCH:
         it can be unit-tested on plain tensors."""
 
         def __init__(self, d_arm: int, d_cand: int, hidden: int = 64, layers: int = 1,
-                     dropout: float = 0.1, cand_hidden: int = 32, memoryless: bool = False):
+                     dropout: float = 0.1, cand_hidden: int = 32, memoryless: bool = False,
+                     n_phases: int = Phase.N_CLASSES):
             super().__init__()
             self.d_arm, self.d_cand, self.hidden, self.layers = d_arm, d_cand, hidden, layers
             # MEMORYLESS ABLATION. The shuffled-feature control answers "are the
@@ -131,7 +137,8 @@ if _TORCH:
             self.gru = nn.GRU(hidden, hidden, num_layers=layers, batch_first=True,
                               dropout=dropout if layers > 1 else 0.0)
             self.drop = nn.Dropout(dropout)
-            self.phase_head = nn.Linear(hidden, Phase.N_CLASSES)
+            self.n_phases = int(n_phases)
+            self.phase_head = nn.Linear(hidden, self.n_phases)
             # Additive attention over candidates: W_h on the state, W_c on the
             # candidate, one shared v. Bias only on the candidate branch so the
             # sum is not doubly parameterised.
@@ -197,7 +204,11 @@ class GRUIntentModel(TrainableIntentModel):
         self.norm_std: np.ndarray | None = None
         self.cand_mean: np.ndarray | None = None
         self.cand_std: np.ndarray | None = None
-        self._builders = {s: EpisodeFeatureBuilder(s, rich=self.config["rich"]) for s in SIDES}
+        self._builders = {s: EpisodeFeatureBuilder(s, rich=self.config["rich"],
+                                                exclusion_phases=self.config.get("held_exclusion_phases"),
+                                                goals=self.config.get("goals"),
+                                                goal_targets=self.config.get("goal_targets"),
+                                                pin_held=bool(self.config.get("pin_held"))) for s in SIDES}
         self._h = {s: None for s in SIDES}
         # Previous frame's predicted phase, used to gate the held-object
         # exclusion. None on the first frame of an episode, which means no
@@ -249,7 +260,7 @@ class GRUIntentModel(TrainableIntentModel):
                     torch.as_tensor(mask[None, None, :], dtype=torch.bool),
                     self._h[side])
             self._h[side] = h
-            phase_posterior = torch.softmax(p_logits[0, 0], -1).numpy().astype(np.float64)
+            phase_posterior = Phase.pad(torch.softmax(p_logits[0, 0], -1).numpy())
             full = torch.softmax(t_logits[0, 0], -1).numpy().astype(np.float64)
 
             null_prob = float(full[-1])
@@ -277,7 +288,8 @@ class GRUIntentModel(TrainableIntentModel):
         c = self.config
         self.net = IntentGRU(d_arm, d_cand, hidden=c["hidden"], layers=c["layers"],
                              dropout=c["dropout"], cand_hidden=c["cand_hidden"],
-                             memoryless=bool(c.get("memoryless", False)))
+                             memoryless=bool(c.get("memoryless", False)),
+                             n_phases=int(c.get("n_phases") or Phase.N_CLASSES))
 
     def save(self, path: str) -> None:
         _require_torch()
@@ -290,14 +302,16 @@ class GRUIntentModel(TrainableIntentModel):
             # Recorded so a checkpoint fit on one feature vector cannot be
             # silently scored against another -- the same guard the HMM's
             # load() has, and for the same reason.
-            "arm_feature_names": list(ARM_FEATURE_NAMES),
-            "cand_feature_names": candidate_feature_names(self.config["rich"]),
+            "arm_feature_names": arm_feature_names(self.config.get("goals")),
+            "cand_feature_names": candidate_feature_names(self.config["rich"], bool(self.config.get("goal_targets"))),
         }, path)
 
     def load(self, path: str) -> None:
         _require_torch()
         ck = torch.load(path, map_location="cpu", weights_only=False)
         ck_config = dict(DEFAULTS, **ck["config"])
+        if not ck_config.get("n_phases"):
+            ck_config["n_phases"] = int(ck["state_dict"]["phase_head.weight"].shape[0])
 
         # Two distinct failures, both silent if unchecked.
         #
@@ -306,11 +320,12 @@ class GRUIntentModel(TrainableIntentModel):
         #    or reordered, every column of the input layer is misaligned and
         #    the model degrades quietly rather than erroring. Compared against
         #    the CHECKPOINT's own config, since that is what it was fit with.
-        if list(ck["arm_feature_names"]) != list(ARM_FEATURE_NAMES):
+        expected_arm = arm_feature_names(ck_config.get("goals"))
+        if list(ck["arm_feature_names"]) != expected_arm:
             raise ValueError(
                 f"checkpoint {path} was fit on arm features {ck['arm_feature_names']} but "
-                f"features.py now produces {list(ARM_FEATURE_NAMES)} -- re-fit it.")
-        produced = candidate_feature_names(ck_config["rich"])
+                f"features.py now produces {expected_arm} -- re-fit it.")
+        produced = candidate_feature_names(ck_config["rich"], bool(ck_config.get("goal_targets")))
         if list(ck["cand_feature_names"]) != produced:
             raise ValueError(
                 f"checkpoint {path} was fit on candidate features {ck['cand_feature_names']} "
@@ -337,8 +352,17 @@ class GRUIntentModel(TrainableIntentModel):
         self.net.eval()
         for k in ("norm_mean", "norm_std", "cand_mean", "cand_std"):
             setattr(self, k, np.asarray(ck[k], dtype=np.float64))
-        self._builders = {s: EpisodeFeatureBuilder(s, rich=self.config["rich"]) for s in SIDES}
+        self._builders = {s: EpisodeFeatureBuilder(s, rich=self.config["rich"],
+                                                exclusion_phases=self.config.get("held_exclusion_phases"),
+                                                goals=self.config.get("goals"),
+                                                goal_targets=self.config.get("goal_targets"),
+                                                pin_held=bool(self.config.get("pin_held"))) for s in SIDES}
         self._h = {s: None for s in SIDES}
+
+    @property
+    def n_phases(self) -> int:
+        """Phase classes this model predicts (5 for sorting checkpoints, 7 for FMB)."""
+        return int(self.config.get("n_phases") or Phase.N_CLASSES)
 
     def fit(self, train_data, val_data, config: dict) -> dict:
         """Delegates to train.fit_model, which owns the optimisation loop.

@@ -55,6 +55,7 @@ except ImportError:
         return np.asarray(Image.fromarray(img).resize((w, h), Image.BILINEAR))
 
 MARKER_ROWS = 2
+GRASP_STATE_HELD = 1  # common.hpp GraspState::HELD, what LiveSource reads as grasp_confirmed
 
 
 # ── Video ──────────────────────────────────────────────────────────────────
@@ -180,11 +181,27 @@ def nearest_idx(stream_ts, grid_ts):
     return np.where(np.abs(grid_ts - left) <= np.abs(right - grid_ts), pos - 1, pos)
 
 
-def candidate_scene_prefix(name):
+def scene_name_prefixes(scene_rows):
+    """Maps scene object/bin names (e.g. 'peg_1_1') to their scene.csv column prefix ('obj0')."""
+    out = {}
+    if not scene_rows:
+        return out
+    first = scene_rows[0]
+    for kind in ("obj", "bin"):
+        for i in range(16):
+            name = (first.get(f"{kind}{i}_name") or "").strip()
+            if name:
+                out[name] = f"{kind}{i}"
+    return out
+
+
+def candidate_scene_prefix(name, name_map=None):
     """Maps a candidate name like 'object_3' or 'bin_1' to its scene.csv
     column prefix ('obj2', 'bin0') -- 1-based candidate naming, 0-based
     scene.csv column indexing. Returns None for EE names or anything that
     doesn't parse (never guess)."""
+    if name_map and name in name_map:
+        return name_map[name]
     if name.startswith("object_"):
         try:
             return f"obj{int(name.split('_')[1]) - 1}"
@@ -198,7 +215,7 @@ def candidate_scene_prefix(name):
     return None
 
 
-def candidate_world_positions(scene_hdr, scene_data, scene_wall, grid, slot_names):
+def candidate_world_positions(scene_hdr, scene_data, scene_wall, grid, slot_names, name_map=None):
     """Returns {joint_slot_index: [len(grid),3] world (x,y,z)} for every
     pick/place slot whose name maps to a scene.csv obj/bin column -- the
     true simulated position, sourced from scene.csv (not reconstructed from
@@ -209,15 +226,23 @@ def candidate_world_positions(scene_hdr, scene_data, scene_wall, grid, slot_name
     """
     sel = nearest_idx(scene_wall, grid)
     out = {}
-    for i, name in slot_names.items():
-        prefix = candidate_scene_prefix(name)
-        if prefix is None:
-            continue
-        cols = [f"{prefix}_{c}" for c in ("x", "y", "z")]
-        if not all(c in scene_hdr for c in cols):
-            continue
-        idx = [scene_hdr.index(c) for c in cols]
-        out[i] = scene_data[:, idx][sel]
+    for i, names in slot_names.items():
+        names = np.asarray(names, dtype=object)
+        if names.ndim == 0:
+            names = np.full(len(grid), names, dtype=object)
+        pos = np.full((len(grid), 3), np.nan)
+        for name in set(names.tolist()):
+            prefix = candidate_scene_prefix(str(name), name_map)
+            if prefix is None:
+                continue
+            cols = [f"{prefix}_{c}" for c in ("x", "y", "z")]
+            if not all(c in scene_hdr for c in cols):
+                continue
+            idx = [scene_hdr.index(c) for c in cols]
+            rows = names == name
+            pos[rows] = scene_data[:, idx][sel][rows]
+        if np.isfinite(pos).any():
+            out[i] = pos
     return out
 
 
@@ -454,8 +479,12 @@ def convert(folder, out_path, rate, scale, cameras, camera_params_path=None, leg
         for arm, (hdr, data, ts) in arms.items():
             sel = nearest_idx(ts, grid)
             g = obs.create_group(arm)
-            for field, n in (("q_", 7), ("dq_", 7), ("tau_J_", 7),
-                             ("tau_ext_", 7), ("O_T_EE_", 16), ("F_ext_", 6)):
+            # O_T_EE_world_* is logged natively from arm_control.cpp on episodes
+            # recorded after that change (T_base_ * O_T_EE, additive alongside the
+            # base-frame O_T_EE above) -- absent on older logs, backfilled offline
+            # instead (see scripts/migrations/backfill_world_ee_pose.py).
+            for field, n in (("q_", 7), ("dq_", 7), ("tau_J_", 7), ("tau_ext_", 7),
+                             ("O_T_EE_", 16), ("O_T_EE_world_", 16), ("F_ext_", 6)):
                 grp = col_group(hdr, data, field, n)
                 if grp is not None:
                     g.create_dataset(field.rstrip("_"), data=grp[sel])
@@ -470,11 +499,14 @@ def convert(folder, out_path, rate, scale, cameras, camera_params_path=None, leg
             # change -- absent on older logs, backfilled offline instead (see
             # scripts/backfill_grasp_confirmed.py).
             gcf = col_one(hdr, data, "grasp_confirmed")
+            if gcf is None:
+                gst = col_one(hdr, data, "grasp_state")
+                gcf = None if gst is None else (gst == GRASP_STATE_HELD)
             if gcf is not None:
                 g.create_dataset("grasp_confirmed", data=gcf[sel].astype(bool))
 
             ag = act.create_group(arm)
-            for field, n in (("q_cmd_", 7), ("O_T_EE_cmd_", 16)):
+            for field, n in (("q_cmd_", 7), ("O_T_EE_cmd_", 16), ("O_T_EE_cmd_world_", 16)):
                 grp = col_group(hdr, data, field, n)
                 if grp is not None:
                     ag.create_dataset(field.rstrip("_"), data=grp[sel])
@@ -533,7 +565,7 @@ def convert(folder, out_path, rate, scale, cameras, camera_params_path=None, leg
             for col, arr in intent.items():
                 if arr.dtype.kind in ("U", "O"):
                     # String column (e.g. slot_name_*): store as variable-length strings
-                    ig.create_dataset(col, data=arr.astype(str), dtype=dt_str)
+                    ig.create_dataset(col, data=np.array([str(x) for x in arr], dtype=object), dtype=dt_str)
                 elif arr.dtype.kind == "f":
                     ig.create_dataset(col, data=_norm_intent_col(col, arr).astype(np.float32))
                 else:
@@ -555,9 +587,10 @@ def convert(folder, out_path, rate, scale, cameras, camera_params_path=None, leg
                 for col, arr in intent.items():
                     if col.startswith("slot_name_"):
                         i = int(col[len("slot_name_"):])
-                        v = arr[0]
-                        slot_names[i] = v.decode() if isinstance(v, (bytes, np.bytes_)) else str(v)
-                positions = candidate_world_positions(scene_hdr, scene_data, scene_wall, grid, slot_names)
+                        slot_names[i] = np.array([v.decode() if isinstance(v, (bytes, np.bytes_)) else str(v)
+                                                  for v in arr], dtype=object)
+                positions = candidate_world_positions(scene_hdr, scene_data, scene_wall, grid, slot_names,
+                                                      scene_name_prefixes(scene_rows))
                 for i, pos in positions.items():
                     ig.create_dataset(f"slot_pos_x_{i}", data=pos[:, 0].astype(np.float32))
                     ig.create_dataset(f"slot_pos_y_{i}", data=pos[:, 1].astype(np.float32))
@@ -568,7 +601,7 @@ def convert(folder, out_path, rate, scale, cameras, camera_params_path=None, leg
             sel = nearest_idx(ts, grid)
             sg = f.create_group("scene")
 
-            for kind, count in (("obj", 4), ("bin", 4)):
+            for kind, count in (("obj", 8), ("bin", 4)):
                 for i in range(count):
                     pose_cols = [f"{kind}{i}_{c}" for c in ("x", "y", "z", "qw", "qx", "qy", "qz")]
                     if all(c in hdr for c in pose_cols):
@@ -577,7 +610,7 @@ def convert(folder, out_path, rate, scale, cameras, camera_params_path=None, leg
                         if np.any(np.abs(vals) > 1e-9):
                             sg.create_dataset(f"{kind}{i}_pose", data=vals)
 
-            for i in range(4):
+            for i in range(8):
                 for field in ("spawn_yaw", "scale"):
                     col = f"obj{i}_{field}"
                     if col in hdr:
@@ -586,7 +619,7 @@ def convert(folder, out_path, rate, scale, cameras, camera_params_path=None, leg
 
             if scene_rows:
                 first = scene_rows[0]
-                for i in range(4):
+                for i in range(8):
                     col = f"obj{i}_color"
                     if col in first and first[col]:
                         sg.create_dataset(f"obj{i}_color",

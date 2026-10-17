@@ -74,7 +74,7 @@ import labels as label_loader  # noqa: E402
 # One colour per phase, ordered idle -> place. Chosen to stay distinguishable
 # in greyscale and for the two phases that matter most (grasp, place) to be the
 # most saturated, since those are where the models differ.
-PHASE_COLOURS = ["#e8edef", "#9ec6d8", "#1c7293", "#f0a848", "#c0392b"]
+PHASE_COLOURS = ["#e8edef", "#9ec6d8", "#1c7293", "#f0a848", "#c0392b", "#7b4fa0", "#e6c229"]
 INK, MUTED = "#1f2a30", "#5f7079"
 
 

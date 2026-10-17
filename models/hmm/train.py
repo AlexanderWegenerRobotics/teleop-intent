@@ -22,9 +22,10 @@ from teleop_orchestrator.sources import ReplaySource
 from teleop_orchestrator.contracts import CANDIDATE_FEATURE_NAMES, GLOBAL_FEATURE_NAMES, Phase
 
 import labels as label_loader
+import task_config
 from .model import HMMIntentModel, SIDES
-from .features import phase_features, world_ee_velocity
-from .held import target_exclusion_mask
+from .features import phase_features, world_ee_velocity, feature_names, goal_array
+from .held import target_exclusion_mask, EXCLUSION_PHASES
 from .target import _MIN_EE_SPEED_FOR_ALIGNMENT
 
 _GAZE_IDX = [GLOBAL_FEATURE_NAMES.index("gaze_x"), GLOBAL_FEATURE_NAMES.index("gaze_y")]
@@ -36,25 +37,26 @@ def read_split(path: str) -> list[str]:
         return [ln.strip() for ln in f if ln.strip()]
 
 
-def build_episode_arrays(hdf5_path: str) -> dict | None:
+def build_episode_arrays(hdf5_path: str, exclusion_phases=None, goals=None) -> dict | None:
     """Returns {side: training-array-dict} for one labeled episode, or None
     if it has no genuine (non-default) hand labels -- see is_genuinely_labeled."""
     with h5py.File(hdf5_path, "r") as ep:
         if not label_loader.is_genuinely_labeled(ep):
             return None
-        per_side_labels = {side: label_loader.load_arm_labels(ep, side) for side in SIDES}
+        per_side_labels = {side: label_loader.load_arm_labels(ep, side)
+                           for side in label_loader.labeled_sides(ep, SIDES)}
 
     src = ReplaySource(hdf5_path, load_images=False)
     frames = [src.frame_at(t) for t in range(len(src))]
     src.close()
 
     out = {}
-    for side in SIDES:
-        phase_labels, target_labels = per_side_labels[side]
+    excl = frozenset(EXCLUSION_PHASES if exclusion_phases is None else exclusion_phases)
+    for side, (phase_labels, target_labels) in per_side_labels.items():
         feats_list, state = [], None
         world_ee_state, ee_vel_list, ee_pos_list = None, [], []
         for frame in frames:
-            f, state = phase_features(frame, side, state)
+            f, state = phase_features(frame, side, state, goals)
             feats_list.append(f)
             # Separate from phase's own ee_vel (see model.py's step() and
             # features.py's world_ee_velocity docstring for why) -- the
@@ -74,7 +76,7 @@ def build_episode_arrays(hdf5_path: str) -> dict | None:
         # teacher-forcing already used for rho_tight/rho_loose, and acceptable
         # for the same reason: the gate only asks "are we carrying yet", a much
         # coarser question than the five-way phase call.
-        target_masks = np.stack([fr.candidate_mask & ~target_exclusion_mask(fr, side, ph)
+        target_masks = np.stack([fr.candidate_mask & ~target_exclusion_mask(fr, side, ph, excl)
                                  for fr, ph in zip(frames, phase_labels)])
 
         out[side] = {
@@ -96,7 +98,7 @@ def build_episode_arrays(hdf5_path: str) -> dict | None:
     return out
 
 
-def gather(store_root: str, episode_ids: list[str]) -> list[dict]:
+def gather(store_root: str, episode_ids: list[str], exclusion_phases=None, goals=None) -> list[dict]:
     """Loads every labeled episode in episode_ids, flattened to one entry per (episode, side)."""
     data = []
     n_labeled = 0
@@ -104,20 +106,18 @@ def gather(store_root: str, episode_ids: list[str]) -> list[dict]:
         path = os.path.join(store_root, eid, "episode.hdf5")
         if not os.path.exists(path):
             continue
-        arrays = build_episode_arrays(path)
+        arrays = build_episode_arrays(path, exclusion_phases, goals)
         if arrays is None:
             continue
         n_labeled += 1
-        data.extend(arrays[side] for side in SIDES)
+        data.extend(arrays.values())
     print(f"  {n_labeled} labeled episode(s) found")
     return data
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--store-root", required=True, help="root folder containing NNN/ episode subdirs")
-    ap.add_argument("--train-split", default="data/splits/train.txt")
-    ap.add_argument("--val-split", default="data/splits/val.txt")
+    task_config.add_dataset_args(ap)
     ap.add_argument("--out", default="checkpoints/hmm/v1.npz")
     # --- emission-model knobs (see models/hmm/phase.py for what each fixes) ---
     ap.add_argument("--std-floor-rel", type=float, default=None,
@@ -141,13 +141,15 @@ def main():
                     help="cap for --sub-states auto (default 12; hitting it means an explicit "
                          "duration model would be cheaper than more chain)")
     args = ap.parse_args()
+    ds = task_config.resolve(args)
+    n_phases = ds["n_phases"]
 
     if args.sub_states == "auto":
         sub_states = "auto"
     else:
         sub_states = [int(x) for x in args.sub_states.replace(" ", "").split(",")]
-        if len(sub_states) != Phase.N_CLASSES:
-            raise SystemExit(f"--sub-states needs {Phase.N_CLASSES} integers, got {len(sub_states)}")
+        if len(sub_states) != n_phases:
+            raise SystemExit(f"--sub-states needs {n_phases} integers, got {len(sub_states)}")
 
     config = {
         "emission_temp": args.emission_temp if args.emission_temp == "auto" else float(args.emission_temp),
@@ -155,6 +157,7 @@ def main():
         "tie_covariance": args.tie_covariance,
         "gaussian_only": args.gaussian_only,
         "sub_states": sub_states,
+        "n_phases": n_phases,
     }
     if args.max_sub_states is not None:
         config["max_sub_states"] = args.max_sub_states
@@ -163,17 +166,25 @@ def main():
     if args.target_committed_weight is not None:
         config["target_committed_weight"] = args.target_committed_weight
 
+    print(f"task {ds['task']}: {n_phases} phases, held exclusion in "
+          f"{[Phase.NAMES[p] for p in ds['held_exclusion_phases']] or 'no phase'}")
     print("Gathering train split...")
-    train_data = gather(args.store_root, read_split(args.train_split))
+    goals = goal_array(ds["goals"])
+    print(f"phase features: {', '.join(feature_names(goals is not None))}")
+    train_data = gather(ds["store_root"], read_split(ds["train_split"]), ds["held_exclusion_phases"], goals)
     print("Gathering val split...")
-    val_data = gather(args.store_root, read_split(args.val_split))
+    val_data = gather(ds["store_root"], read_split(ds["val_split"]), ds["held_exclusion_phases"], goals)
 
     if not train_data:
         raise SystemExit("No labeled training episodes found -- check --store-root and data/splits/train.txt")
+    top = max(int(np.max(d["phase_labels"])) for d in train_data + val_data)
+    if top >= n_phases:
+        raise SystemExit(f"labels contain phase id {top} but the model has {n_phases} phases -- "
+                         f"pass --dataset or --n-phases {top + 1}")
 
     _report_alignment_coverage(train_data)
 
-    model = HMMIntentModel()
+    model = HMMIntentModel(exclusion_phases=ds["held_exclusion_phases"], goals=goals)
     history = model.fit(train_data, val_data, config=config)
     _report(history, model)
 
@@ -230,7 +241,7 @@ def _report(history: dict, model: HMMIntentModel) -> None:
         print("\nphase duration model (sub-state chains):")
         print(f"  {'phase':<12}{'segments':>10}{'obs mean':>10}{'obs CV':>9}{'N':>4}"
               f"{'model mean':>12}{'model CV':>10}   note")
-        for k in range(Phase.N_CLASSES):
+        for k in range(int(ds["n_phases"])):
             info = (sel or {}).get(k, {})
             n_seg = info.get("n_segments", 0)
             obs_mean, obs_cv = info.get("mean", float("nan")), info.get("cv", float("nan"))

@@ -1,0 +1,5 @@
+task: sorting
+
+phases: [IDLE, APPROACH, GRASP, TRANSPORT, PLACE]
+
+bins_are_goals: true

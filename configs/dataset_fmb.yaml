@@ -1,0 +1,42 @@
+data:
+  store_root: C:/Users/ceti/Documents/05_data/fmb-1-desk
+  manifest: data/fmb_board_1/manifest.csv
+  episode_glob: "[0-9][0-9][0-9]"
+  require_intent: true
+  include_success: [success, partial]
+split:
+  seed: 0
+  ratios:
+    train: 0.70
+    val: 0.15
+    test: 0.15
+  by: "episode"
+  include_success:
+    - success
+    - partial
+  stratify_by:
+    - success
+  min_gaze_valid_frac: 0.0
+  freeze_test: true
+  out_dir: "data/splits_fmb_board_1"
+state:
+  enum:
+    OFFLINE: 0
+    IDLE: 1
+    HOMING: 2
+    AWAITING: 3
+    ENGAGED: 4
+    PAUSED: 5
+    FAULT: 6
+    STOP: 7
+    RECOVERING: 8
+    UNDEFINED: 255
+  train_states: [ENGAGED]
+task:
+  name: fmb_board_1
+  n_phases: 7
+  held_exclusion_phases: [TRANSPORT, INSERT, CORRECT]
+  pin_held_object: true
+  goals_from: labeling/tasks/fmb_board_1.yaml
+  goal_target_phases: [TRANSPORT, INSERT, PLACE, CORRECT]
+  goal_occupied_m: 0.01

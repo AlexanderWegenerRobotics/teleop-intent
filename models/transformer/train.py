@@ -60,13 +60,15 @@ from teleop_orchestrator.sources import ReplaySource
 from teleop_orchestrator.contracts import NULL_TARGET, Phase
 
 import labels as label_loader
+import task_config
 from metrics import classification_metrics
 
-from ..gru.features import ARM_FEATURE_NAMES, candidate_feature_names
+from ..gru.features import arm_feature_names, candidate_feature_names
 from ..gru.train import (build_episode_arrays, gather, read_split, target_index_masked,
                          compute_norm_stats, phase_class_weights, shuffle_features_in_time,
+                         check_label_range,
                          write_history, report_unreachable_targets, _GracefulStop,
-                         IGNORE_INDEX, TRAIN_DEFAULTS)
+                         IGNORE_INDEX, TRAIN_DEFAULTS, GazeDropout)
 from .model import TransformerIntentModel, SIDES, PRESETS, _require_torch
 
 def fit_model(model: TransformerIntentModel, train_data: list[dict], val_data: list[dict],
@@ -89,12 +91,14 @@ def fit_model(model: TransformerIntentModel, train_data: list[dict], val_data: l
     d_cand = train_data[0]["cand"].shape[2]
     model.build(d_arm, d_cand)
     net = model.net
+    n_ph = model.n_phases
+    check_label_range(train_data + list(val_data or []), n_ph)
 
-    w, counts = phase_class_weights(train_data, str(cfg["phase_class_weight"]))
+    w, counts = phase_class_weights(train_data, str(cfg["phase_class_weight"]), n_ph)
     print("  phase frame counts: " + "  ".join(
-        f"{Phase.NAMES[i]}={int(counts[i])}" for i in range(Phase.N_CLASSES)))
+        f"{Phase.NAMES[i]}={int(counts[i])}" for i in range(n_ph)))
     print("  phase loss weights: " + "  ".join(
-        f"{Phase.NAMES[i]}={w[i]:.2f}" for i in range(Phase.N_CLASSES)))
+        f"{Phase.NAMES[i]}={w[i]:.2f}" for i in range(n_ph)))
     weight = torch.as_tensor(w, dtype=torch.float32)
 
     opt = torch.optim.AdamW(net.parameters(), lr=float(cfg["lr"]),
@@ -107,14 +111,23 @@ def fit_model(model: TransformerIntentModel, train_data: list[dict], val_data: l
     # copies 116 times a pass for no benefit; the arrays total ~10 MB, so
     # holding them costs nothing worth measuring.
     _cache: dict[int, tuple] = {}
+    _aug: dict[int, tuple] = {}
+    dropout = None
+    if float(cfg["gaze_dropout"]) > 0:
+        dropout = GazeDropout(cfg["gaze_dropout"], cfg["gaze_dropout_span"],
+                              candidate_feature_names(cfg.get("rich", False), bool(cfg.get("goal_targets"))),
+                              seed=int(cfg["seed"]))
+        print(f"  gaze dropout p={cfg['gaze_dropout']} span={cfg['gaze_dropout_span']} (train split only)")
+    select_last = cfg["select"] == "last"
 
     def tensors(d):
         key = id(d)
         cached = _cache.get(key)
         if cached is not None:
             return cached
-        arm = (d["arm"] - model.norm_mean) / model.norm_std
-        cand = (d["cand"] - model.cand_mean) / model.cand_std
+        arm0, cand0 = _aug.get(key, (d["arm"], d["cand"]))
+        arm = (arm0 - model.norm_mean) / model.norm_std
+        cand = (cand0 - model.cand_mean) / model.cand_std
         tgt_idx, _bad = target_index_masked(d["target"], d["mask"])
         out = (torch.as_tensor(arm[None], dtype=torch.float32),
                torch.as_tensor(cand[None], dtype=torch.float32),
@@ -153,7 +166,7 @@ def fit_model(model: TransformerIntentModel, train_data: list[dict], val_data: l
                 if scorable.any():
                     tgt_ok += int((tl[0].argmax(-1).numpy()[scorable] == idx[scorable]).sum())
                     tgt_n += int(scorable.sum())
-        m = classification_metrics(true, pred, Phase.N_CLASSES)
+        m = classification_metrics(true, pred, n_ph)
         m["target_accuracy"] = tgt_ok / max(tgt_n, 1)
         return m
 
@@ -187,6 +200,10 @@ def fit_model(model: TransformerIntentModel, train_data: list[dict], val_data: l
         for epoch in range(int(cfg["epochs"])):
             net.train()
             np.random.shuffle(order)
+            if dropout is not None:
+                for d in train_data:
+                    _aug[id(d)] = dropout.apply(d)
+                    _cache.pop(id(d), None)
             tot_p, tot_t, nb, t0 = 0.0, 0.0, 0, time.time()
             for i in order:
                 if stop.requested:
@@ -216,7 +233,7 @@ def fit_model(model: TransformerIntentModel, train_data: list[dict], val_data: l
                     keep = slice(s - ctx, e - ctx)      # scored rows inside the encoded span
                     pl, tl, _ = net(arm[:, ctx:e], cand[:, ctx:e], mask[:, ctx:e])
                     pl, tl = pl[:, keep], tl[:, keep]
-                    loss_p = F.cross_entropy(pl.reshape(-1, Phase.N_CLASSES),
+                    loss_p = F.cross_entropy(pl.reshape(-1, n_ph),
                                              ph[:, s:e].reshape(-1), weight=weight)
                     # ignore_index drops frames whose labelled target the mask
                     # excludes; if a chunk is entirely such frames the result is
@@ -254,18 +271,23 @@ def fit_model(model: TransformerIntentModel, train_data: list[dict], val_data: l
                       f"val macroF1 {m['macro_f1']:.3f}  acc {m['accuracy']:.3f}  "
                       f"target {m['target_accuracy']:.3f}  ({row['secs']:.0f}s)"
                       + ("  [partial epoch]" if stop.requested else ""))
-                if improved:
+                if select_last:
+                    snapshot(f"epoch {epoch}")
+                elif improved:
                     snapshot(f"epoch {epoch} (val macro F1 {m['macro_f1']:.3f})")
 
             if stop.requested:
                 interrupted = True
                 print(f"  stopped by request at epoch {epoch}")
                 break
-            if m and epoch - best["epoch"] >= int(cfg["patience"]):
+            if m and not select_last and epoch - best["epoch"] >= int(cfg["patience"]):
                 print(f"  early stop: no val improvement for {cfg['patience']} epochs")
                 break
 
-    if best["state"] is not None:
+    if select_last:
+        print(f"  kept last epoch {history[-1]['epoch'] if history else -1} (--select last; best val was epoch "
+              f"{best['epoch']}, {best['macro_f1']:.3f})")
+    elif best["state"] is not None:
         # Selection on val macro F1, not on the last epoch and not on val loss.
         # Applies to an interrupted run too: stopping early should give you the
         # best model the run found, not whatever it happened to hold when the
@@ -307,10 +329,8 @@ def write_history(checkpoint_path: str, hist: dict) -> str:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--store-root", required=True)
-    ap.add_argument("--train-split", default="data/splits/train.txt")
-    ap.add_argument("--val-split", default="data/splits/val.txt")
-    ap.add_argument("--out", default="checkpoints/gru/v1.pt")
+    task_config.add_dataset_args(ap)
+    ap.add_argument("--out", default="checkpoints/transformer/v1.pt")
     ap.add_argument("--preset", default="matched", choices=sorted(PRESETS),
                     help="matched = the GRU's parameter count; small = a conventional transformer")
     ap.add_argument("--window", type=int, default=512,
@@ -331,23 +351,42 @@ def main():
     ap.add_argument("--rich", action="store_true",
                     help="add candidate features the HMM never had; off by default so the "
                          "model-class comparison is not confounded by an input change")
+    ap.add_argument("--gaze-dropout", type=float, default=0.0,
+                    help="fraction of training frames whose gaze is corrupted (invalid, or held on another "
+                         "candidate than the label); 0 = off. Train split only")
+    ap.add_argument("--gaze-dropout-span", type=int, default=TRAIN_DEFAULTS["gaze_dropout_span"],
+                    help="mean length of a corrupted stretch in frames; 1 = independent per frame")
+    ap.add_argument("--select", default="best", choices=["best", "last"],
+                    help="best = restore the best val macro F1 epoch (early stopping); last = train exactly "
+                         "--epochs and keep the final weights (for seed comparisons)")
     ap.add_argument("--shuffled-control", action="store_true",
                     help="train on time-shuffled features to measure the script-only floor")
     args = ap.parse_args()
+    ds = task_config.resolve(args)
 
     cfg = dict(PRESETS[args.preset], preset=args.preset, window=args.window, rich=args.rich,
-               epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
+               n_phases=ds["n_phases"], held_exclusion_phases=ds["held_exclusion_phases"],
+               goals=ds["goals"], goal_targets=ds["goal_targets"], epochs=args.epochs, lr=args.lr,
+               weight_decay=args.weight_decay,
                tbptt=args.tbptt, patience=args.patience, seed=args.seed,
                phase_class_weight=args.phase_class_weight, num_threads=args.num_threads,
+               pin_held=ds["pin_held"], gaze_dropout=args.gaze_dropout,
+               gaze_dropout_span=args.gaze_dropout_span, select=args.select,
                # Lets fit_model write the best model as it goes, so Ctrl-C or a
                # crash never costs more than the epochs since the last
                # improvement.
                checkpoint_path=args.out)
 
+    print(f"task {ds['task']}: {ds['n_phases']} phases, held exclusion in "
+          f"{[Phase.NAMES[p] for p in ds['held_exclusion_phases']] or 'no phase'}")
     print("Gathering train split...")
-    train_data = gather(args.store_root, read_split(args.train_split), rich=args.rich)
+    train_data = gather(ds["store_root"], read_split(ds["train_split"]), rich=args.rich,
+                        exclusion_phases=ds["held_exclusion_phases"], goals=ds["goals"],
+                        goal_targets=ds["goal_targets"], pin_held=ds["pin_held"])
     print("Gathering val split...")
-    val_data = gather(args.store_root, read_split(args.val_split), rich=args.rich)
+    val_data = gather(ds["store_root"], read_split(ds["val_split"]), rich=args.rich,
+                      exclusion_phases=ds["held_exclusion_phases"], goals=ds["goals"],
+                      goal_targets=ds["goal_targets"], pin_held=ds["pin_held"])
     if not train_data:
         raise SystemExit("No labeled training episodes found -- check --store-root and the split file")
 
@@ -357,9 +396,11 @@ def main():
         val_data = shuffle_features_in_time(val_data, seed=args.seed + 1)
 
     print(f"\npreset {args.preset}: {PRESETS[args.preset]}   window {args.window} frames")
-    print(f"arm features ({len(ARM_FEATURE_NAMES)}): {', '.join(ARM_FEATURE_NAMES)}")
-    names = candidate_feature_names(args.rich)
-    print(f"candidate features ({len(names)}): {', '.join(names)}\n")
+    arm_names = arm_feature_names(ds["goals"])
+    print(f"arm features ({len(arm_names)}): {', '.join(arm_names)}")
+    names = candidate_feature_names(args.rich, bool(ds["goal_targets"]))
+    print(f"candidate features ({len(names)}): {', '.join(names)}")
+    print(f"goal candidates: {', '.join(ds['goal_targets']['names'])}\n" if ds["goal_targets"] else "goal candidates: none\n")
 
     if args.dropout is not None:
         cfg["dropout"] = args.dropout

@@ -1,0 +1,37 @@
+task: fmb_board_1
+
+phases: [IDLE, APPROACH, GRASP, TRANSPORT, INSERT, PLACE, CORRECT]
+
+part_types:
+  peg_1: cradle
+  peg_3: bar
+  peg_4: bow
+
+goals:
+  side_pos: {type: peg_1, pos: [0.868, 0.000, 0.705]}
+  side_neg: {type: peg_1, pos: [0.732, 0.000, 0.705]}
+  corridor: {type: peg_3, pos: [0.801, 0.000, 0.740]}
+  centre:   {type: peg_4, pos: [0.800, 0.000, 0.705]}
+
+yaw_symmetry_deg: 180
+
+thresholds:
+  moved_m: 0.01
+  lift_m: 0.005
+  grasp_radius_m: 0.05
+  grasp_far_m: 0.10
+  approach_hysteresis_m: 0.03
+  idle_speed_mps: 0.02
+  idle_min_s: 0.8
+  insert_radius_m: 0.08
+  goal_capture_xy_m: 0.08
+  seated_pos_m: 0.004
+  seated_yaw_deg: 4.0
+  seated_hold_s: 0.3
+  place_retreat_m: 0.05
+  place_max_s: 2.0
+  settle_s: 1.5
+  push_moved_m: 0.005
+  push_ee_radius_m: 0.08
+  long_grasp_s: 3.0
+  retract_m: 0.01

@@ -100,3 +100,60 @@ def classification_metrics(true, pred, n_classes: int) -> dict:
         "confusion": cm,
         "n_frames": int(true.size),
     }
+
+
+def target_segments(true_target, null_target: int = -1) -> list[tuple[int, int, int]]:
+    """Contiguous runs of a committed target label as (target, start, end_exclusive), nulls dropped.
+
+    A run spans phases: an object stays the target through APPROACH and GRASP, a goal through
+    TRANSPORT, INSERT and PLACE, so one run is one subgoal from the operator's point of view.
+    """
+    return [(k, s, e) for k, s, e in segments(true_target) if k != null_target]
+
+
+def settle_latency(true_target, pred_target, hold: int = 10, null_target: int = -1) -> list[dict]:
+    """Per subgoal: how long the prediction takes to lock onto the labeled target.
+
+    first_correct is the first frame the prediction equals the label; settled is the first
+    frame from which it stays equal for `hold` frames (the whole run when the run is shorter).
+    Both are offsets from the run's start, or None when it never happens. This is the number
+    a nudge that needs lead time depends on; frame accuracy hides it.
+    """
+    true_target, pred_target = np.asarray(true_target), np.asarray(pred_target)
+    out = []
+    for k, s, e in target_segments(true_target, null_target):
+        hit = pred_target[s:e] == k
+        first = int(np.argmax(hit)) if hit.any() else None
+        h = min(int(hold), e - s)
+        settled = None
+        if h > 0:
+            run = np.convolve(hit.astype(int), np.ones(h, dtype=int), mode="valid") == h
+            if run.any():
+                settled = int(np.argmax(run))
+        out.append({"target": int(k), "start": int(s), "end": int(e), "length": int(e - s),
+                    "first_correct": first, "settled": settled, "hit": hit})
+    return out
+
+
+def latency_summary(segs: list[dict], early: int = 30) -> dict:
+    """Settle rate, latency quantiles (frames) and accuracy inside the first `early` frames of a run."""
+    n = len(segs)
+    if n == 0:
+        return {"n": 0, "settle_rate": float("nan"), "settled_median": float("nan"), "settled_mean": float("nan"),
+                "settled_p90": float("nan"), "first_correct_median": float("nan"), "early_frames_correct": float("nan")}
+    settled = np.array([s["settled"] for s in segs if s["settled"] is not None], dtype=float)
+    first = np.array([s["first_correct"] for s in segs if s["first_correct"] is not None], dtype=float)
+    early_hits, early_total = 0.0, 0
+    for s in segs:
+        w = min(int(early), s["length"])
+        early_total += w
+        early_hits += float(np.sum(s["hit"][:w]))
+    return {
+        "n": n,
+        "settle_rate": float(len(settled) / n),
+        "settled_median": float(np.median(settled)) if settled.size else float("nan"),
+        "settled_mean": float(settled.mean()) if settled.size else float("nan"),
+        "settled_p90": float(np.percentile(settled, 90)) if settled.size else float("nan"),
+        "first_correct_median": float(np.median(first)) if first.size else float("nan"),
+        "early_frames_correct": float(early_hits / early_total) if early_total else float("nan"),
+    }
